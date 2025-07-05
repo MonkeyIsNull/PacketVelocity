@@ -1,4 +1,4 @@
 # Packet Velocity
 
-This is empty for now
+First GitHub version coming soon!
 
