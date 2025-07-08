@@ -13,8 +13,6 @@ I have gotten it to run and log packets to stdout but beyond that you may be in 
 - Actual Linux support is untested at this time.
 
 
-
-
 ### What's Implemented
 
 **Core Components:**
@@ -152,7 +150,7 @@ pcv_stats* pcv_get_stats(pcv_handle* h);
 
 ## Dependencies
 
-- macOS: No external dependencies
+- macOS: VFM and possibly RistrettoDB
 - Linux: libxdp, libbpf (optional - stubs provided)
 - VFM: https://github.com/MonkeyIsNull/VelocityFilterMachine 
 - RistrettoDB: https://github.com/MonkeyIsNull/RistrettoDB (stubbed - not tested)
