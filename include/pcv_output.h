@@ -20,34 +20,12 @@ typedef enum pcv_output_type {
     PCV_OUTPUT_CUSTOM
 } pcv_output_type;
 
-/* Flow tuple for aggregation */
-typedef struct pcv_flow_tuple {
-    uint32_t src_ip;
-    uint32_t dst_ip;
-    uint16_t src_port;
-    uint16_t dst_port;
-    uint8_t protocol;
-} pcv_flow_tuple;
-
-/* Flow statistics */
-typedef struct pcv_flow_stats {
-    pcv_flow_tuple tuple;
-    uint64_t first_seen_ns;
-    uint64_t last_seen_ns;
-    uint64_t packet_count;
-    uint64_t byte_count;
-    uint32_t flags;
-} pcv_flow_stats;
+/* Legacy flow structures - deprecated, use pcv_flow.h instead */
 
 /* Output context */
 typedef struct pcv_output {
     pcv_output_type type;
     void* context;
-    
-    /* Buffering */
-    pcv_flow_stats* flow_buffer;
-    size_t flow_buffer_size;
-    size_t flow_count;
     
     /* Configuration */
     uint32_t flush_interval_ms;

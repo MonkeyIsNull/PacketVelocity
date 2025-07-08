@@ -15,6 +15,7 @@
 /dist/
 /bin/
 /target/
+/scratch_files/
 
 # Rust
 /target/

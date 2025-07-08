@@ -3,7 +3,7 @@
 
 CC = clang
 CFLAGS = -Wall -Wextra -O3 -std=c11 -pedantic
-INCLUDES = -I./include
+INCLUDES = -I./include -I./scratch_files
 LDFLAGS = 
 
 # macOS specific flags
@@ -22,7 +22,9 @@ SOURCES = src/pcv_main.c \
           src/pcv_platform.c \
           src/pcv_filter_vfm.c \
           src/pcv_output_ristretto.c \
-          src/pcv_ringbuf.c
+          src/pcv_ringbuf.c \
+          src/pcv_flow.c \
+          scratch_files/ristretto_stub.c
 
 # Platform-specific sources
 ifeq ($(UNAME_S),Darwin)
