@@ -1,0 +1,5 @@
+; VFM Assembly: Accept All Packets
+; Always returns 1 to accept every packet
+
+PUSH 1    ; Push 1 onto stack
+RET       ; Return with value from stack

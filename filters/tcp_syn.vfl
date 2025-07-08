@@ -1,0 +1,5 @@
+; VFLisp filter: TCP SYN Packets
+; Accept only TCP SYN packets (tcp-flags bit 1 set)
+(if (= proto 6)
+    (= (& tcp-flags 2) 2)
+    0)

@@ -2,9 +2,12 @@
 # High-performance packet capture library
 
 CC = clang
-CFLAGS = -Wall -Wextra -O3 -std=c11 -pedantic
-INCLUDES = -I./include -I./scratch_files
-LDFLAGS = 
+CFLAGS = -Wall -Wextra -O3 -std=c11
+INCLUDES = -I./include -I/usr/local/include
+LDFLAGS = -L/usr/local/lib -lvfm
+
+# Special flags for VFM compilation (uses GNU extensions)
+VFM_CFLAGS = -Wall -Wextra -O3 -std=gnu11 
 
 # macOS specific flags
 MACOS_CFLAGS = -DPLATFORM_MACOS
@@ -24,7 +27,7 @@ SOURCES = src/pcv_main.c \
           src/pcv_output_ristretto.c \
           src/pcv_ringbuf.c \
           src/pcv_flow.c \
-          scratch_files/ristretto_stub.c
+          src/ristretto_stub.c
 
 # Platform-specific sources
 ifeq ($(UNAME_S),Darwin)
@@ -59,8 +62,21 @@ endif
 $(TARGET): $(OBJECTS)
 	$(CC) $(OBJECTS) -o $@ $(LDFLAGS)
 
+TEST_VFM_OBJECTS = $(filter-out src/pcv_main.o, $(OBJECTS))
+
+test_vfm: test_vfm.c $(TEST_VFM_OBJECTS)
+	$(CC) $(VFM_CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
 %.o: %.c
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# Special rule for VFM filter compilation
+src/pcv_filter_vfm.o: src/pcv_filter_vfm.c
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(VFM_CFLAGS) $(MACOS_CFLAGS) $(INCLUDES) -c $< -o $@
+else ifeq ($(UNAME_S),Linux)
+	$(CC) $(VFM_CFLAGS) $(LINUX_CFLAGS) $(INCLUDES) -c $< -o $@
+endif
 
 clean:
 	rm -f $(OBJECTS) $(TARGET)

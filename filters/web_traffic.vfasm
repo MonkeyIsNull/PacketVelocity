@@ -1,0 +1,23 @@
+; VFM Assembly: Web Traffic (HTTP/HTTPS)
+; Accept TCP packets on HTTP (80) or HTTPS (443) ports
+
+    LD8 23      ; Load IP protocol field
+    PUSH 6      ; TCP protocol number
+    JNE reject  ; Jump to reject if not TCP
+    
+    LD16 36     ; Load destination port
+    DUP         ; Duplicate port on stack for first comparison
+    PUSH 80     ; HTTP port
+    JEQ accept  ; Accept if port 80 (consumes duplicated port and 80)
+    
+    ; Port is still on stack from DUP
+    PUSH 443    ; HTTPS port
+    JEQ accept  ; Accept if port 443
+    
+reject:
+    PUSH 0      ; Push 0 (drop)
+    RET         ; Return
+    
+accept:
+    PUSH 1      ; Push 1 (accept)
+    RET         ; Return

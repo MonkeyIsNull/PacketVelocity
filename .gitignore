@@ -6,6 +6,7 @@
 *.exe
 *.dll
 *.rdb
+*.vfm
 
 # MacOS system files
 .DS_Store
@@ -71,6 +72,7 @@ CLAUDE.md
 
 # Ristretto Stuff
 *.db
-# Ignore accidentally created top-level binary
+# Ignore accidentally created top-level binaries
 /ristretto
+/packetvelocity
 

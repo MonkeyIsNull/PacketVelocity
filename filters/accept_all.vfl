@@ -1,0 +1,3 @@
+; VFLisp filter: Accept All Packets
+; Always returns true (1) to accept every packet
+1

@@ -73,6 +73,9 @@ int pcv_filter_vfm_init(void);
 void pcv_filter_vfm_cleanup(void);
 const char* pcv_filter_vfm_version(void);
 
+/* Load VFM filter from file */
+pcv_filter* pcv_filter_create_from_file(const char* filename);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,7 +1,8 @@
 #include "pcv_filter.h"
-#include "vfm.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vfm.h>
 
 /* Create filter from bytecode */
 pcv_filter* pcv_filter_create(pcv_filter_type type, const void* bytecode, 
@@ -21,14 +22,14 @@ pcv_filter* pcv_filter_create(pcv_filter_type type, const void* bytecode,
     
     switch (type) {
     case PCV_FILTER_VFM:
-        /* Create VFM context */
-        filter->vfm_context = vfm_create(bytecode, bytecode_len);
+        /* Create VFM VM state */
+        filter->vfm_context = vfm_create();
         if (!filter->vfm_context) {
             free(filter);
             return NULL;
         }
         
-        /* Copy bytecode */
+        /* Copy bytecode for reference first */
         filter->filter_data = malloc(bytecode_len);
         if (!filter->filter_data) {
             vfm_destroy(filter->vfm_context);
@@ -36,6 +37,14 @@ pcv_filter* pcv_filter_create(pcv_filter_type type, const void* bytecode,
             return NULL;
         }
         memcpy(filter->filter_data, bytecode, bytecode_len);
+        
+        /* Load VFM program using the stable copy */
+        if (vfm_load_program(filter->vfm_context, (const uint8_t*)filter->filter_data, (uint32_t)bytecode_len) != VFM_SUCCESS) {
+            free(filter->filter_data);
+            vfm_destroy(filter->vfm_context);
+            free(filter);
+            return NULL;
+        }
         filter->filter_size = bytecode_len;
         break;
         
@@ -115,7 +124,7 @@ pcv_filter_decision pcv_filter_apply(pcv_filter* filter, const uint8_t* data,
     switch (filter->type) {
     case PCV_FILTER_VFM:
         if (filter->vfm_context) {
-            int result = vfm_execute(filter->vfm_context, data, length);
+            int result = vfm_execute(filter->vfm_context, data, (uint16_t)length);
             decision = result > 0 ? PCV_FILTER_ACCEPT : PCV_FILTER_DROP;
         }
         break;
@@ -175,5 +184,55 @@ void pcv_filter_vfm_cleanup(void) {
 }
 
 const char* pcv_filter_vfm_version(void) {
-    return vfm_version();
+    return "VFM 1.0.0";  /* VFM doesn't expose version function in the header */
+}
+
+/* Load VFM filter from file */
+pcv_filter* pcv_filter_create_from_file(const char* filename) {
+    FILE* file;
+    uint8_t* bytecode;
+    size_t file_size;
+    pcv_filter* filter;
+    
+    if (!filename) {
+        return NULL;
+    }
+    
+    file = fopen(filename, "rb");
+    if (!file) {
+        return NULL;
+    }
+    
+    /* Get file size */
+    fseek(file, 0, SEEK_END);
+    file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    
+    if (file_size == 0) {
+        fclose(file);
+        return NULL;
+    }
+    
+    /* Allocate buffer */
+    bytecode = malloc(file_size);
+    if (!bytecode) {
+        fclose(file);
+        return NULL;
+    }
+    
+    /* Read file */
+    if (fread(bytecode, 1, file_size, file) != file_size) {
+        free(bytecode);
+        fclose(file);
+        return NULL;
+    }
+    
+    fclose(file);
+    
+    
+    /* Create filter - note: pcv_filter_create will copy the bytecode */
+    filter = pcv_filter_create(PCV_FILTER_VFM, bytecode, file_size);
+    
+    free(bytecode);
+    return filter;
 }

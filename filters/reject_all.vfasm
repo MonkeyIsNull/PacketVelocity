@@ -1,0 +1,5 @@
+; VFM Assembly: Reject All Packets
+; Always returns 0 to drop every packet
+
+PUSH 0    ; Push 0 onto stack
+RET       ; Return with value from stack

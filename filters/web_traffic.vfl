@@ -1,0 +1,6 @@
+; VFLisp filter: Web Traffic (HTTP/HTTPS)
+; Accept TCP packets on HTTP (80) or HTTPS (443) ports
+(if (= proto 6)
+    (or (= dst-port 80)
+        (= dst-port 443))
+    0)

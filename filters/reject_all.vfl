@@ -1,0 +1,3 @@
+; VFLisp filter: Reject All Packets
+; Always returns false (0) to drop every packet
+0
