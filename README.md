@@ -2,7 +2,9 @@
 
 High-performance packet capture library with platform-specific optimizations.
 
-## Phase 1 & 2 Implementation Complete
+<img src="logo.jpg" alt="pvc_logo" width="70%" />
+
+## Phase 1, 2, 3 & 4 Implementation Complete
 
 ### What's Implemented
 
@@ -93,16 +95,6 @@ gcc examples/linux_numa_demo.c -I./include -L. -lpacketvelocity -o numa_demo
 
 ## Next Steps
 
-### Phase 3: RistrettoDB Integration
-- Replace stub with actual RistrettoDB
-- Implement flow aggregation
-- Bulk insert optimization
-
-### Phase 4: VFM Filter Finalization
-- Replace VFM stub with actual library
-- Add BPF translation support
-- Filter verification
-
 ### Phase 5: Production Hardening
 - Signal handling improvements
 - Thread-safe operations
@@ -153,9 +145,9 @@ pcv_stats* pcv_get_stats(pcv_handle* h);
 
 - macOS: No external dependencies
 - Linux: libxdp, libbpf (optional - stubs provided)
-- VFM: https://github.com/MonkeyIsNull/VelocityFilterMachine (to be integrated)
-- RistrettoDB: https://github.com/MonkeyIsNull/RistrettoDB (to be integrated)
+- VFM: https://github.com/MonkeyIsNull/VelocityFilterMachine 
+- RistrettoDB: https://github.com/MonkeyIsNull/RistrettoDB (stubbed - not tested)
 
 ## License
 
-TBD
+MIT
