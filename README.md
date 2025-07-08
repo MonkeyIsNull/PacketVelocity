@@ -2,9 +2,18 @@
 
 High-performance packet capture library with platform-specific optimizations.
 
-<img src="logo.jpg" alt="pvc_logo" width="70%" />
+<img src="logo.jpg" alt="pvc_logo" width="85%" />
 
-## Phase 1, 2, 3 & 4 Implementation Complete
+## Status
+Please note, this is still a work in progress and very alpha.
+I have gotten it to run and log packets to stdout but beyond that you may be in for a wild and broken ride.
+
+- Phase 1, 2, 3 & 4 are complete
+
+- Actual Linux support is untested at this time.
+
+
+
 
 ### What's Implemented
 
@@ -13,7 +22,7 @@ High-performance packet capture library with platform-specific optimizations.
 - macOS BPF backend with mmap() support
 - Linux AF_XDP backend with zero-copy support
 - Ring buffer for batch processing
-- VFM (VelocityFilterMachine) integration stub
+- VFM (VelocityFilterMachine)
 - CLI tool with filter support
 - RistrettoDB output stub
 
