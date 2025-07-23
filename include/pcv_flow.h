@@ -12,7 +12,30 @@ extern "C" {
 
 /* PacketVelocity Flow Aggregation System */
 
-/* Flow key for 5-tuple identification */
+/* Address family types */
+typedef enum {
+    PCV_ADDR_IPV4 = 4,
+    PCV_ADDR_IPV6 = 6
+} pcv_addr_family_t;
+
+/* IP address union for IPv4/IPv6 support */
+typedef union {
+    uint32_t ipv4;          /* IPv4 address (network byte order) */
+    uint8_t ipv6[16];       /* IPv6 address (network byte order) */
+} pcv_ip_addr_t;
+
+/* Enhanced flow key with IPv4/IPv6 support */
+typedef struct pcv_flow_key_v6 {
+    pcv_ip_addr_t src_ip;   /* Source IP address */
+    pcv_ip_addr_t dst_ip;   /* Destination IP address */
+    uint16_t src_port;      /* Source port */
+    uint16_t dst_port;      /* Destination port */
+    uint8_t protocol;       /* IP protocol */
+    uint8_t addr_family;    /* PCV_ADDR_IPV4 or PCV_ADDR_IPV6 */
+    uint16_t reserved;      /* Padding for alignment */
+} pcv_flow_key_v6;
+
+/* Legacy IPv4-only flow key for backward compatibility */
 typedef struct pcv_flow_key {
     uint32_t src_ip;
     uint32_t dst_ip;
@@ -88,13 +111,25 @@ int pcv_flow_update(pcv_flow_table* table, const pcv_packet* packet);
 pcv_flow_stats* pcv_flow_lookup(pcv_flow_table* table, const pcv_flow_key* key);
 int pcv_flow_expire_old(pcv_flow_table* table, uint64_t current_time_ns);
 
-/* Flow key extraction */
+/* Flow key extraction - Legacy IPv4 API */
 int pcv_flow_extract_key(const pcv_packet* packet, pcv_flow_key* key);
 uint32_t pcv_flow_hash_key(const pcv_flow_key* key);
 
-/* Utility functions */
+/* Flow key extraction - Enhanced IPv4/IPv6 API */
+int pcv_flow_extract_key_v6(const pcv_packet* packet, pcv_flow_key_v6* key);
+uint32_t pcv_flow_hash_key_v6(const pcv_flow_key_v6* key);
+
+/* Key conversion utilities */
+int pcv_flow_key_v4_to_v6(const pcv_flow_key* v4_key, pcv_flow_key_v6* v6_key);
+int pcv_flow_key_v6_to_v4(const pcv_flow_key_v6* v6_key, pcv_flow_key* v4_key);
+
+/* Utility functions - Legacy IPv4 */
 void pcv_flow_key_to_string(const pcv_flow_key* key, char* buffer, size_t size);
 int pcv_flow_key_compare(const pcv_flow_key* a, const pcv_flow_key* b);
+
+/* Utility functions - Enhanced IPv4/IPv6 */
+void pcv_flow_key_v6_to_string(const pcv_flow_key_v6* key, char* buffer, size_t size);
+int pcv_flow_key_v6_compare(const pcv_flow_key_v6* a, const pcv_flow_key_v6* b);
 
 /* Flow iteration for bulk operations */
 typedef void (*pcv_flow_iterator)(const pcv_flow_stats* flow, void* user_data);

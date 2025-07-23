@@ -10,7 +10,10 @@
 #include "pcv_filter.h"
 #include "pcv_flow.h"
 #include <arpa/inet.h>
-#include "../../VelocityFilterMachine/dsl/vflisp/vflisp_types.h"
+#include <ifaddrs.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include "vflisp_types.h"
 
 /* Global handle for signal handling */
 static pcv_handle* g_handle = NULL;
@@ -18,6 +21,14 @@ static volatile int g_running = 1;
 
 /* Packet counter */
 static uint64_t g_packet_count = 0;
+
+/* Structure to pass filter and local addresses to callback */
+typedef struct {
+    pcv_filter* filter;
+    uint32_t local_ip;
+    uint8_t local_ipv6[16];
+    bool has_ipv6;
+} callback_context;
 
 /* Signal handler */
 static void signal_handler(int sig) {
@@ -54,34 +65,121 @@ static const char* protocol_to_string(uint8_t protocol) {
     }
 }
 
-/* Format packet information in tcpdump style */
-static void format_packet_info(const pcv_packet* packet, char* buffer, size_t size) {
-    pcv_flow_key key;
-    char src_ip[16], dst_ip[16];
+/* Get local IPv4 address of interface */
+static uint32_t get_interface_ip(const char* interface_name) {
+    struct ifaddrs *ifaddrs_ptr = NULL;
+    struct ifaddrs *ifa = NULL;
+    uint32_t local_ip = 0;
     
-    /* Extract flow key from packet */
-    if (pcv_flow_extract_key(packet, &key) != 0) {
+    if (getifaddrs(&ifaddrs_ptr) == -1) {
+        return 0;
+    }
+    
+    for (ifa = ifaddrs_ptr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL) continue;
+        
+        if (ifa->ifa_addr->sa_family == AF_INET && 
+            strcmp(ifa->ifa_name, interface_name) == 0) {
+            struct sockaddr_in* addr_in = (struct sockaddr_in*)ifa->ifa_addr;
+            local_ip = ntohl(addr_in->sin_addr.s_addr);
+            break;
+        }
+    }
+    
+    freeifaddrs(ifaddrs_ptr);
+    return local_ip;
+}
+
+/* Get local IPv6 address of interface */
+static bool get_interface_ipv6(const char* interface_name, uint8_t* ipv6_addr) {
+    struct ifaddrs *ifaddrs_ptr = NULL;
+    struct ifaddrs *ifa = NULL;
+    bool found = false;
+    
+    if (getifaddrs(&ifaddrs_ptr) == -1) {
+        return false;
+    }
+    
+    for (ifa = ifaddrs_ptr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL) continue;
+        
+        if (ifa->ifa_addr->sa_family == AF_INET6 && 
+            strcmp(ifa->ifa_name, interface_name) == 0) {
+            struct sockaddr_in6* addr_in6 = (struct sockaddr_in6*)ifa->ifa_addr;
+            
+            /* Skip link-local addresses */
+            if (!IN6_IS_ADDR_LINKLOCAL(&addr_in6->sin6_addr)) {
+                memcpy(ipv6_addr, &addr_in6->sin6_addr, 16);
+                found = true;
+                break;
+            }
+        }
+    }
+    
+    freeifaddrs(ifaddrs_ptr);
+    return found;
+}
+
+/* Format packet information with directional arrows and IPv6 support */
+static void format_packet_info(const pcv_packet* packet, uint32_t local_ip, const uint8_t* local_ipv6, char* buffer, size_t size) {
+    pcv_flow_key_v6 key;
+    char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
+    bool is_outgoing;
+    const char* arrow;
+    
+    /* Extract flow key from packet using IPv6-capable parser */
+    if (pcv_flow_extract_key_v6(packet, &key) != 0) {
         /* Fallback for unparseable packets */
         snprintf(buffer, size, "[unparseable packet, %u bytes]", packet->captured_length);
         return;
     }
     
-    /* Convert IP addresses to strings */
-    inet_ntop(AF_INET, &key.src_ip, src_ip, sizeof(src_ip));
-    inet_ntop(AF_INET, &key.dst_ip, dst_ip, sizeof(dst_ip));
+    /* Format addresses and determine direction based on address family */
+    if (key.addr_family == PCV_ADDR_IPV4) {
+        /* IPv4 packet */
+        inet_ntop(AF_INET, &key.src_ip.ipv4, src_ip, sizeof(src_ip));
+        inet_ntop(AF_INET, &key.dst_ip.ipv4, dst_ip, sizeof(dst_ip));
+        is_outgoing = (ntohl(key.src_ip.ipv4) == local_ip);
+    } else if (key.addr_family == PCV_ADDR_IPV6) {
+        /* IPv6 packet */
+        inet_ntop(AF_INET6, key.src_ip.ipv6, src_ip, sizeof(src_ip));
+        inet_ntop(AF_INET6, key.dst_ip.ipv6, dst_ip, sizeof(dst_ip));
+        is_outgoing = (local_ipv6 && memcmp(key.src_ip.ipv6, local_ipv6, 16) == 0);
+    } else {
+        snprintf(buffer, size, "[unknown IP version %u, %u bytes]", key.addr_family, packet->captured_length);
+        return;
+    }
     
-    /* Format based on protocol */
+    arrow = is_outgoing ? ">" : "<";
+    const char* ip_version = (key.addr_family == PCV_ADDR_IPV6) ? "6" : "";
+    
+    /* Format with directional arrows */
     if (key.protocol == 6 || key.protocol == 17) {
         /* TCP or UDP with ports */
-        snprintf(buffer, size, "IP %s.%u > %s.%u: %s %u",
-                 src_ip, key.src_port,
-                 dst_ip, key.dst_port,
-                 protocol_to_string(key.protocol),
-                 packet->captured_length);
+        const char* direction = is_outgoing ? "OUT" : "IN ";
+        if (key.addr_family == PCV_ADDR_IPV6) {
+            /* IPv6 addresses need brackets for port notation */
+            snprintf(buffer, size, "%s IP%s [%s].%u %s [%s].%u: %s %u",
+                     direction, ip_version,
+                     src_ip, key.src_port, arrow,
+                     dst_ip, key.dst_port,
+                     protocol_to_string(key.protocol),
+                     packet->captured_length);
+        } else {
+            /* IPv4 standard notation */
+            snprintf(buffer, size, "%s IP%s %s.%u %s %s.%u: %s %u",
+                     direction, ip_version,
+                     src_ip, key.src_port, arrow,
+                     dst_ip, key.dst_port,
+                     protocol_to_string(key.protocol),
+                     packet->captured_length);
+        }
     } else {
         /* Other protocols without ports */
-        snprintf(buffer, size, "IP %s > %s: %s %u",
-                 src_ip, dst_ip,
+        const char* direction = is_outgoing ? "OUT" : "IN ";
+        snprintf(buffer, size, "%s IP%s %s %s %s: %s %u",
+                 direction, ip_version,
+                 src_ip, arrow, dst_ip,
                  protocol_to_string(key.protocol),
                  packet->captured_length);
     }
@@ -89,14 +187,14 @@ static void format_packet_info(const pcv_packet* packet, char* buffer, size_t si
 
 /* Packet callback */
 static void packet_callback(const pcv_packet* packet, void* user_data) {
-    pcv_filter* filter = (pcv_filter*)user_data;
+    callback_context* ctx = (callback_context*)user_data;
     pcv_filter_decision decision = PCV_FILTER_ACCEPT;
     char timestamp[32];
     char packet_info[256];
     
     /* Apply filter if present */
-    if (filter) {
-        decision = pcv_filter_apply(filter, packet->data, packet->captured_length);
+    if (ctx && ctx->filter) {
+        decision = pcv_filter_apply(ctx->filter, packet->data, packet->captured_length);
         if (decision != PCV_FILTER_ACCEPT) {
             return;
         }
@@ -104,9 +202,11 @@ static void packet_callback(const pcv_packet* packet, void* user_data) {
     
     g_packet_count++;
     
-    /* Format timestamp and packet info */
+    /* Format timestamp and packet info with direction */
     format_timestamp(packet->timestamp_ns, timestamp, sizeof(timestamp));
-    format_packet_info(packet, packet_info, sizeof(packet_info));
+    uint32_t local_ip = ctx ? ctx->local_ip : 0;
+    const uint8_t* local_ipv6 = (ctx && ctx->has_ipv6) ? ctx->local_ipv6 : NULL;
+    format_packet_info(packet, local_ip, local_ipv6, packet_info, sizeof(packet_info));
     
     /* Print tcpdump-style output */
     printf("%s %s\n", timestamp, packet_info);
@@ -326,8 +426,24 @@ int main(int argc, char* argv[]) {
     
     printf("Capturing on %s... Press Ctrl+C to stop\n", interface);
     
+    /* Get local addresses for directional packet display */
+    uint32_t local_ip = get_interface_ip(interface);
+    uint8_t local_ipv6[16];
+    bool has_ipv6 = get_interface_ipv6(interface, local_ipv6);
+    
+    /* Create callback context with filter and local addresses */
+    callback_context ctx = {
+        .filter = filter,
+        .local_ip = local_ip,
+        .has_ipv6 = has_ipv6
+    };
+    
+    if (has_ipv6) {
+        memcpy(ctx.local_ipv6, local_ipv6, 16);
+    }
+    
     /* Start capture */
-    int result = pcv_capture(g_handle, packet_callback, filter);
+    int result = pcv_capture(g_handle, packet_callback, &ctx);
     
     /* Cleanup */
     pcv_stats* stats = pcv_get_stats(g_handle);
@@ -337,9 +453,9 @@ int main(int argc, char* argv[]) {
         printf("  Interface dropped:  %llu (packets lost due to buffer overruns)\n", stats->packets_dropped);
         printf("  Application output: %llu (packets displayed to user)\n", g_packet_count);
         
-        if (filter) {
+        if (ctx.filter) {
             uint64_t processed, accepted, dropped;
-            pcv_filter_get_stats(filter, &processed, &accepted, &dropped);
+            pcv_filter_get_stats(ctx.filter, &processed, &accepted, &dropped);
             
             printf("\nFilter Statistics:\n");
             printf("  Total processed: %llu\n", processed);
