@@ -36,6 +36,7 @@ typedef struct pcv_bpf_handle {
     bool immediate_mode;        /* BIOCIMMEDIATE enabled */
     bool promiscuous;           /* Promiscuous mode */
     uint32_t timeout_ms;        /* Read timeout */
+    volatile bool break_loop;   /* Signal to break capture loop */
     
     /* Statistics */
     uint64_t packets_seen;      /* Packets processed */

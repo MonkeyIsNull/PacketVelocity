@@ -1,6 +1,6 @@
 #include "pcv_output.h"
 #include "pcv_flow.h"
-#include "../scratch_files/ristretto.h"
+#include "ristretto.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,8 +14,8 @@
  */
 
 typedef struct pcv_ristretto_context {
-    char* connection_string;
-    RistrettoTable* table;
+    char* database_file;
+    RistrettoDB* db;
     
     /* Flow aggregation */
     pcv_flow_table* flow_table;
@@ -34,24 +34,21 @@ typedef struct pcv_ristretto_context {
     uint64_t total_flushes;
     uint64_t insert_errors;
     
-    /* Value buffer for RistrettoDB */
-    RistrettoValue* value_buffer;
-    
     /* Fallback logging */
     FILE* log_file;
 } pcv_ristretto_context;
 
-/* Initialize RistrettoDB table using Table V2 API */
-static int init_ristretto_table(pcv_ristretto_context* ctx) {
+/* Initialize RistrettoDB database and table */
+static int init_ristretto_database(pcv_ristretto_context* ctx) {
     const char* schema_sql = 
-        "CREATE TABLE packet_flows ("
-        "flow_id INTEGER, "
+        "CREATE TABLE IF NOT EXISTS packet_flows ("
+        "flow_id INTEGER PRIMARY KEY, "
         "src_ip TEXT, "
         "dst_ip TEXT, "
         "src_port INTEGER, "
         "dst_port INTEGER, "
         "protocol INTEGER, "
-        "first_seen INTEGER, "  /* Unix timestamp */
+        "first_seen INTEGER, "
         "last_seen INTEGER, "
         "duration_ms INTEGER, "
         "packet_count INTEGER, "
@@ -60,21 +57,23 @@ static int init_ristretto_table(pcv_ristretto_context* ctx) {
         "flow_state INTEGER"
         ")";
     
+    /* Open the database */
+    ctx->db = ristretto_open(ctx->database_file);
+    if (!ctx->db) {
+        fprintf(stderr, "Failed to open RistrettoDB database: %s\n", ctx->database_file);
+        return -1;
+    }
+    
     /* Create the table */
-    ctx->table = ristretto_table_create("packet_flows", schema_sql);
-    if (!ctx->table) {
-        fprintf(stderr, "Failed to create RistrettoDB table\n");
+    RistrettoResult result = ristretto_exec(ctx->db, schema_sql);
+    if (result != RISTRETTO_OK) {
+        fprintf(stderr, "Failed to create packet_flows table: %s\n", ristretto_error_string(result));
+        ristretto_close(ctx->db);
+        ctx->db = NULL;
         return -1;
     }
     
-    /* Allocate value buffer for row operations */
-    ctx->value_buffer = calloc(13, sizeof(RistrettoValue));  /* 13 columns */
-    if (!ctx->value_buffer) {
-        ristretto_table_close(ctx->table);
-        return -1;
-    }
-    
-    printf("RistrettoDB table initialized successfully\n");
+    printf("RistrettoDB database initialized successfully: %s\n", ctx->database_file);
     return 0;
 }
 
@@ -83,46 +82,42 @@ static void ip_to_string(uint32_t ip, char* buffer, size_t size) {
     inet_ntop(AF_INET, &ip, buffer, size);
 }
 
-/* Insert flow into RistrettoDB table */
-static int insert_flow_to_table(pcv_ristretto_context* ctx, const pcv_flow_stats* flow) {
+/* Insert flow into RistrettoDB table using SQL */
+static int insert_flow_to_database(pcv_ristretto_context* ctx, const pcv_flow_stats* flow) {
     char src_ip_str[16], dst_ip_str[16];
+    char sql_buffer[1024];
     
     /* Convert IP addresses to strings */
     ip_to_string(flow->key.src_ip, src_ip_str, sizeof(src_ip_str));
     ip_to_string(flow->key.dst_ip, dst_ip_str, sizeof(dst_ip_str));
     
-    /* Prepare values for insertion */
-    ctx->value_buffer[0] = ristretto_value_integer(flow->flow_id);
-    ctx->value_buffer[1] = ristretto_value_text(src_ip_str);
-    ctx->value_buffer[2] = ristretto_value_text(dst_ip_str);
-    ctx->value_buffer[3] = ristretto_value_integer(flow->key.src_port);
-    ctx->value_buffer[4] = ristretto_value_integer(flow->key.dst_port);
-    ctx->value_buffer[5] = ristretto_value_integer(flow->key.protocol);
-    ctx->value_buffer[6] = ristretto_value_integer(flow->first_seen_ns / 1000000000);  /* Unix timestamp */
-    ctx->value_buffer[7] = ristretto_value_integer(flow->last_seen_ns / 1000000000);
-    ctx->value_buffer[8] = ristretto_value_integer(flow->duration_ns / 1000000);  /* Milliseconds */
-    ctx->value_buffer[9] = ristretto_value_integer(flow->packet_count);
-    ctx->value_buffer[10] = ristretto_value_integer(flow->byte_count);
-    ctx->value_buffer[11] = ristretto_value_integer(flow->tcp_flags);
-    ctx->value_buffer[12] = ristretto_value_integer(flow->flow_state);
+    /* Build INSERT statement */
+    snprintf(sql_buffer, sizeof(sql_buffer),
+        "INSERT INTO packet_flows ("
+        "flow_id, src_ip, dst_ip, src_port, dst_port, protocol, "
+        "first_seen, last_seen, duration_ms, packet_count, byte_count, tcp_flags, flow_state"
+        ") VALUES ("
+        "%lu, '%s', '%s', %u, %u, %u, "
+        "%lu, %lu, %lu, %lu, %lu, %u, %u"
+        ")",
+        flow->flow_id, src_ip_str, dst_ip_str,
+        flow->key.src_port, flow->key.dst_port, flow->key.protocol,
+        flow->first_seen_ns / 1000000000,  /* Unix timestamp */
+        flow->last_seen_ns / 1000000000,
+        flow->duration_ns / 1000000,       /* Milliseconds */
+        flow->packet_count, flow->byte_count,
+        flow->tcp_flags, flow->flow_state
+    );
     
-    /* Insert row */
-    if (ristretto_table_append_row(ctx->table, ctx->value_buffer)) {
+    /* Execute the insert */
+    RistrettoResult result = ristretto_exec(ctx->db, sql_buffer);
+    if (result == RISTRETTO_OK) {
         ctx->total_inserts++;
         ctx->current_batch_count++;
-        
-        /* Clean up text values */
-        ristretto_value_destroy(&ctx->value_buffer[1]);
-        ristretto_value_destroy(&ctx->value_buffer[2]);
-        
         return 0;
     } else {
         ctx->insert_errors++;
-        
-        /* Clean up text values on error too */
-        ristretto_value_destroy(&ctx->value_buffer[1]);
-        ristretto_value_destroy(&ctx->value_buffer[2]);
-        
+        fprintf(stderr, "Failed to insert flow: %s\n", ristretto_error_string(result));
         return -1;
     }
 }
@@ -136,7 +131,7 @@ static void bulk_insert_callback(const pcv_flow_stats* flow, void* user_data) {
         return;
     }
     
-    insert_flow_to_table(ctx, flow);
+    insert_flow_to_database(ctx, flow);
 }
 
 /* Create output handler */
@@ -165,12 +160,12 @@ pcv_output* pcv_output_create(pcv_output_type type, const char* target) {
     output->flush_interval_ms = 1000;  /* 1 second default */
     output->max_flows = 100000;  /* Increased capacity */
     
-    /* Save connection string */
-    ctx->connection_string = strdup(target ? target : "packet_flows");
+    /* Save database file path */
+    ctx->database_file = strdup(target ? target : "packet_flows.db");
     
-    /* Initialize RistrettoDB table */
-    if (init_ristretto_table(ctx) < 0) {
-        free(ctx->connection_string);
+    /* Initialize RistrettoDB database */
+    if (init_ristretto_database(ctx) < 0) {
+        free(ctx->database_file);
         free(ctx);
         free(output);
         return NULL;
@@ -186,9 +181,8 @@ pcv_output* pcv_output_create(pcv_output_type type, const char* target) {
     /* Create flow table */
     ctx->flow_table = pcv_flow_table_create(&ctx->flow_config);
     if (!ctx->flow_table) {
-        free(ctx->value_buffer);
-        ristretto_table_close(ctx->table);
-        free(ctx->connection_string);
+        ristretto_close(ctx->db);
+        free(ctx->database_file);
         free(ctx);
         free(output);
         return NULL;
@@ -204,13 +198,13 @@ pcv_output* pcv_output_create(pcv_output_type type, const char* target) {
     
     /* Open fallback log file */
     char log_filename[256];
-    snprintf(log_filename, sizeof(log_filename), "%s.log", ctx->connection_string);
+    snprintf(log_filename, sizeof(log_filename), "%s.log", ctx->database_file);
     ctx->log_file = fopen(log_filename, "a");
     if (!ctx->log_file) {
         ctx->log_file = stdout;
     }
     
-    printf("RistrettoDB table initialized: %s\n", ctx->connection_string);
+    printf("RistrettoDB database initialized: %s\n", ctx->database_file);
     printf("Flow table capacity: %u flows, %u buckets\n", 
            ctx->flow_config.max_flows, ctx->flow_config.hash_buckets);
     printf("Flush configuration: batch_size=%u, interval=%llu ms\n",
@@ -229,19 +223,9 @@ void pcv_output_destroy(pcv_output* output) {
     if (output->type == PCV_OUTPUT_RISTRETTO && output->context) {
         pcv_ristretto_context* ctx = output->context;
         
-        /* Final flush of any pending data */
-        if (ctx->table) {
-            ristretto_table_flush(ctx->table);
-        }
-        
-        /* Close RistrettoDB table */
-        if (ctx->table) {
-            ristretto_table_close(ctx->table);
-        }
-        
-        /* Free value buffer */
-        if (ctx->value_buffer) {
-            free(ctx->value_buffer);
+        /* Close RistrettoDB database */
+        if (ctx->db) {
+            ristretto_close(ctx->db);
         }
         
         /* Destroy flow table */
@@ -259,7 +243,7 @@ void pcv_output_destroy(pcv_output* output) {
         printf("  Total flushes: %llu\n", ctx->total_flushes);
         printf("  Insert errors: %llu\n", ctx->insert_errors);
         
-        free(ctx->connection_string);
+        free(ctx->database_file);
         free(ctx);
     }
     
@@ -330,15 +314,10 @@ int pcv_output_flush(pcv_output* output) {
     /* Iterate through flows and insert expired/finished ones */
     pcv_flow_iterate(ctx->flow_table, bulk_insert_callback, ctx);
     
-    /* Flush data to disk when we have inserted flows */
+    /* Update statistics */
     if (ctx->current_batch_count > 0) {
-        if (ristretto_table_flush(ctx->table)) {
-            ctx->total_flushes++;
-            printf("Flushed %u flows to RistrettoDB\n", ctx->current_batch_count);
-        } else {
-            fprintf(stderr, "Failed to flush flows to RistrettoDB\n");
-            return -1;
-        }
+        ctx->total_flushes++;
+        printf("Flushed %u flows to RistrettoDB\n", ctx->current_batch_count);
     }
     
     /* Update statistics */

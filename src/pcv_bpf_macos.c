@@ -256,7 +256,7 @@ static int macos_capture(pcv_handle* handle, pcv_callback callback, void* user_d
         return -PCV_ERROR_INVALID_ARG;
     }
     
-    while (1) {
+    while (!bpf_handle->break_loop) {
         /* Read from BPF device */
         bytes_read = read(bpf_handle->fd, bpf_handle->buffer, bpf_handle->buffer_size);
         
@@ -329,7 +329,7 @@ static int macos_capture_batch(pcv_handle* handle, pcv_batch_callback callback, 
         return -PCV_ERROR_NO_MEMORY;
     }
     
-    while (1) {
+    while (!bpf_handle->break_loop) {
         /* Read from BPF device */
         bytes_read = read(bpf_handle->fd, bpf_handle->buffer, bpf_handle->buffer_size);
         
@@ -391,8 +391,13 @@ static int macos_capture_batch(pcv_handle* handle, pcv_batch_callback callback, 
 }
 
 static int macos_breakloop(pcv_handle* handle) {
-    /* TODO: Implement loop breaking */
-    (void)handle;
+    pcv_bpf_handle* bpf_handle = (pcv_bpf_handle*)handle;
+    
+    if (!bpf_handle) {
+        return -PCV_ERROR_INVALID_ARG;
+    }
+    
+    bpf_handle->break_loop = true;
     return PCV_SUCCESS;
 }
 

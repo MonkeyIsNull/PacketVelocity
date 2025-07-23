@@ -81,6 +81,7 @@ typedef struct pcv_xdp_handle {
     uint32_t batch_size;
     bool numa_aware;
     int cpu_core;              /* CPU core to pin to (-1 = no pinning) */
+    volatile bool break_loop;  /* Signal to break capture loop */
     
     /* Statistics */
     uint64_t packets_received;

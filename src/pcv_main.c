@@ -8,6 +8,9 @@
 #include <errno.h>
 #include "pcv.h"
 #include "pcv_filter.h"
+#include "pcv_flow.h"
+#include <arpa/inet.h>
+#include "../../VelocityFilterMachine/dsl/vflisp/vflisp_types.h"
 
 /* Global handle for signal handling */
 static pcv_handle* g_handle = NULL;
@@ -28,12 +31,60 @@ static void signal_handler(int sig) {
 /* Format timestamp */
 static void format_timestamp(uint64_t timestamp_ns, char* buffer, size_t size) {
     time_t seconds = timestamp_ns / 1000000000;
-    uint32_t nanoseconds = timestamp_ns % 1000000000;
+    uint32_t microseconds = (timestamp_ns % 1000000000) / 1000;
     struct tm* tm_info = localtime(&seconds);
     
     strftime(buffer, size, "%H:%M:%S", tm_info);
     size_t len = strlen(buffer);
-    snprintf(buffer + len, size - len, ".%09u", nanoseconds);
+    snprintf(buffer + len, size - len, ".%06u", microseconds);
+}
+
+/* Convert protocol number to string */
+static const char* protocol_to_string(uint8_t protocol) {
+    switch (protocol) {
+        case 1:  return "ICMP";
+        case 6:  return "TCP";
+        case 17: return "UDP";
+        case 2:  return "IGMP";
+        case 47: return "GRE";
+        case 50: return "ESP";
+        case 51: return "AH";
+        case 89: return "OSPF";
+        default: return "proto";
+    }
+}
+
+/* Format packet information in tcpdump style */
+static void format_packet_info(const pcv_packet* packet, char* buffer, size_t size) {
+    pcv_flow_key key;
+    char src_ip[16], dst_ip[16];
+    
+    /* Extract flow key from packet */
+    if (pcv_flow_extract_key(packet, &key) != 0) {
+        /* Fallback for unparseable packets */
+        snprintf(buffer, size, "[unparseable packet, %u bytes]", packet->captured_length);
+        return;
+    }
+    
+    /* Convert IP addresses to strings */
+    inet_ntop(AF_INET, &key.src_ip, src_ip, sizeof(src_ip));
+    inet_ntop(AF_INET, &key.dst_ip, dst_ip, sizeof(dst_ip));
+    
+    /* Format based on protocol */
+    if (key.protocol == 6 || key.protocol == 17) {
+        /* TCP or UDP with ports */
+        snprintf(buffer, size, "IP %s.%u > %s.%u: %s %u",
+                 src_ip, key.src_port,
+                 dst_ip, key.dst_port,
+                 protocol_to_string(key.protocol),
+                 packet->captured_length);
+    } else {
+        /* Other protocols without ports */
+        snprintf(buffer, size, "IP %s > %s: %s %u",
+                 src_ip, dst_ip,
+                 protocol_to_string(key.protocol),
+                 packet->captured_length);
+    }
 }
 
 /* Packet callback */
@@ -41,6 +92,7 @@ static void packet_callback(const pcv_packet* packet, void* user_data) {
     pcv_filter* filter = (pcv_filter*)user_data;
     pcv_filter_decision decision = PCV_FILTER_ACCEPT;
     char timestamp[32];
+    char packet_info[256];
     
     /* Apply filter if present */
     if (filter) {
@@ -52,20 +104,12 @@ static void packet_callback(const pcv_packet* packet, void* user_data) {
     
     g_packet_count++;
     
-    /* Format and print packet info */
+    /* Format timestamp and packet info */
     format_timestamp(packet->timestamp_ns, timestamp, sizeof(timestamp));
+    format_packet_info(packet, packet_info, sizeof(packet_info));
     
-    printf("%s %5u bytes", timestamp, packet->captured_length);
-    
-    /* Print first few bytes as hex */
-    printf(" |");
-    for (uint32_t i = 0; i < 16 && i < packet->captured_length; i++) {
-        printf(" %02x", packet->data[i]);
-    }
-    if (packet->captured_length > 16) {
-        printf(" ...");
-    }
-    printf("\n");
+    /* Print tcpdump-style output */
+    printf("%s %s\n", timestamp, packet_info);
 }
 
 /* Print usage */
@@ -76,6 +120,7 @@ static void print_usage(const char* program) {
     printf("Options:\n");
     printf("  -i, --interface <name>    Network interface to capture from\n");
     printf("  -f, --filter <file>       VFM filter bytecode file\n");
+    printf("  -l, --lisp <expr>         VFLisp expression to compile dynamically\n");
     printf("  -p, --promiscuous         Enable promiscuous mode\n");
     printf("  -I, --immediate           Enable immediate mode (low latency)\n");
     printf("  -b, --buffer-size <size>  Set buffer size (default: 4MB)\n");
@@ -132,6 +177,7 @@ static uint8_t* load_filter_file(const char* filename, size_t* size) {
 int main(int argc, char* argv[]) {
     const char* interface = NULL;
     const char* filter_file = NULL;
+    const char* lisp_expr = NULL;
     bool promiscuous = false;
     bool immediate = false;
     bool verbose = false;
@@ -146,6 +192,7 @@ int main(int argc, char* argv[]) {
     static struct option long_options[] = {
         {"interface", required_argument, 0, 'i'},
         {"filter", required_argument, 0, 'f'},
+        {"lisp", required_argument, 0, 'l'},
         {"promiscuous", no_argument, 0, 'p'},
         {"immediate", no_argument, 0, 'I'},
         {"buffer-size", required_argument, 0, 'b'},
@@ -157,13 +204,16 @@ int main(int argc, char* argv[]) {
     
     /* Parse command line */
     int opt;
-    while ((opt = getopt_long(argc, argv, "i:f:pIb:vVh", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:f:l:pIb:vVh", long_options, NULL)) != -1) {
         switch (opt) {
         case 'i':
             interface = optarg;
             break;
         case 'f':
             filter_file = optarg;
+            break;
+        case 'l':
+            lisp_expr = optarg;
             break;
         case 'p':
             promiscuous = true;
@@ -198,6 +248,12 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
+    /* Check for conflicting filter options */
+    if (filter_file && lisp_expr) {
+        fprintf(stderr, "Error: Cannot specify both -f and -l options\n");
+        return 1;
+    }
+    
     /* Setup signal handling */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -218,6 +274,26 @@ int main(int argc, char* argv[]) {
         
         if (verbose) {
             printf("Loaded VFM filter from %s (%zu bytes)\n", filter_file, filter_size);
+        }
+    } else if (lisp_expr) {
+        /* Compile VFLisp expression */
+        char error_msg[256];
+        int result = vfl_compile_string(lisp_expr, &filter_bytecode, (uint32_t*)&filter_size, 
+                                       error_msg, sizeof(error_msg));
+        if (result < 0) {
+            fprintf(stderr, "Error: VFLisp compilation failed: %s\n", error_msg);
+            return 1;
+        }
+        
+        filter = pcv_filter_create(PCV_FILTER_VFM, filter_bytecode, filter_size);
+        if (!filter) {
+            fprintf(stderr, "Error: Cannot create VFLisp filter\n");
+            free(filter_bytecode);
+            return 1;
+        }
+        
+        if (verbose) {
+            printf("Compiled VFLisp expression: %s (%zu bytes)\n", lisp_expr, filter_size);
         }
     }
     
@@ -256,17 +332,26 @@ int main(int argc, char* argv[]) {
     /* Cleanup */
     pcv_stats* stats = pcv_get_stats(g_handle);
     if (stats) {
-        printf("\nCapture statistics:\n");
-        printf("  Packets received: %llu\n", stats->packets_received);
-        printf("  Packets dropped:  %llu\n", stats->packets_dropped);
-        printf("  Packets filtered: %llu\n", g_packet_count);
+        printf("\nCapture Statistics:\n");
+        printf("  Interface received: %llu (total packets seen by network interface)\n", stats->packets_received);
+        printf("  Interface dropped:  %llu (packets lost due to buffer overruns)\n", stats->packets_dropped);
+        printf("  Application output: %llu (packets displayed to user)\n", g_packet_count);
         
         if (filter) {
             uint64_t processed, accepted, dropped;
             pcv_filter_get_stats(filter, &processed, &accepted, &dropped);
-            printf("  Filter processed: %llu\n", processed);
-            printf("  Filter accepted:  %llu\n", accepted);
-            printf("  Filter dropped:   %llu\n", dropped);
+            
+            printf("\nFilter Statistics:\n");
+            printf("  Total processed: %llu\n", processed);
+            if (processed > 0) {
+                double accept_pct = (double)accepted / processed * 100.0;
+                double reject_pct = (double)dropped / processed * 100.0;
+                printf("  Matched criteria: %llu (%.1f%%)\n", accepted, accept_pct);
+                printf("  Rejected by filter: %llu (%.1f%%)\n", dropped, reject_pct);
+            } else {
+                printf("  Matched criteria: %llu\n", accepted);
+                printf("  Rejected by filter: %llu\n", dropped);
+            }
         }
     }
     

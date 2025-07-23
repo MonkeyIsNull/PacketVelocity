@@ -310,6 +310,8 @@ int pcv_xdp_process_rx_ring(pcv_xdp_socket* socket, pcv_callback callback,
     pcv_xdp_fill_ring_populate(socket->umem);
     
     while (1) {
+        /* Check for break signal (TODO: make this work with handle) */
+        
         /* Receive batch of packets */
         received = pcv_xdp_receive_batch(socket, packets, PCV_XDP_MAX_BATCH_SIZE);
         
@@ -419,10 +421,23 @@ static int linux_capture(pcv_handle* handle, pcv_callback callback, void* user_d
         return -PCV_ERROR_INVALID_ARG;
     }
     
-    printf("Linux stub: Would start packet capture loop\n");
+    printf("Linux stub: Starting packet capture loop with break_loop support\n");
     
-    /* Stub: would implement AF_XDP packet processing loop here */
-    return pcv_xdp_process_rx_ring(xdp_handle->socket, callback, user_data);
+    /* Implement capture loop with break_loop checking */
+    while (!xdp_handle->break_loop) {
+        /* In stub mode, just sleep and check for break */
+#ifndef HAVE_LIBXDP
+        usleep(100000); /* 100ms sleep */
+#else
+        /* Real AF_XDP implementation would go here */
+        int result = pcv_xdp_process_rx_ring(xdp_handle->socket, callback, user_data);
+        if (result < 0) {
+            return result;
+        }
+#endif
+    }
+    
+    return PCV_SUCCESS;
 }
 
 static int linux_capture_batch(pcv_handle* handle, pcv_batch_callback callback, void* user_data) {
@@ -452,8 +467,13 @@ static int linux_capture_batch(pcv_handle* handle, pcv_batch_callback callback, 
 }
 
 static int linux_breakloop(pcv_handle* handle) {
-    (void)handle;
-    printf("Linux stub: Would break capture loop\n");
+    pcv_xdp_handle* xdp_handle = (pcv_xdp_handle*)handle;
+    
+    if (!xdp_handle) {
+        return -PCV_ERROR_INVALID_ARG;
+    }
+    
+    xdp_handle->break_loop = true;
     return PCV_SUCCESS;
 }
 
