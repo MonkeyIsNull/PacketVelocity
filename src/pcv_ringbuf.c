@@ -65,7 +65,7 @@ void pcv_ringbuf_reset(pcv_ringbuf* rb) {
 }
 
 /* Calculate available contiguous write space */
-static size_t pcv_ringbuf_write_space(const pcv_ringbuf* rb) {
+__attribute__((unused)) static size_t pcv_ringbuf_write_space(const pcv_ringbuf* rb) {
     if (rb->is_full) {
         return 0;
     }
