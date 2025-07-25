@@ -17,6 +17,7 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
+#include <time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -186,7 +187,7 @@ static int linux_capture(pcv_handle* handle, pcv_callback callback, void* user_d
             if (errno == EINTR) {
                 continue;  /* Interrupted by signal */
             }
-            return -PCV_ERROR_IO;
+            return -PCV_ERROR_GENERIC;
         }
         
         if (packet_len == 0) {
@@ -223,7 +224,7 @@ static int linux_capture_batch(pcv_handle* handle, pcv_batch_callback callback, 
     }
     
     printf("Linux: Batch capture not implemented for raw sockets\n");
-    return -PCV_ERROR_NOT_SUPPORTED;
+    return -PCV_ERROR_GENERIC;
 }
 
 static int linux_breakloop(pcv_handle* handle) {
@@ -266,7 +267,7 @@ static const char* linux_get_platform_name(void) {
 }
 
 static uint32_t linux_get_capabilities(void) {
-    return PCV_CAP_PROMISCUOUS_MODE;
+    return 0;  /* No special capabilities for raw sockets */
 }
 
 /* Platform operations vtable */
