@@ -6,19 +6,14 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Detect if components are installed in /usr/local or running from source
+# Detect if PacketVelocity is installed in /usr/local or running from source
 if [[ -x "/usr/local/bin/packetvelocity" ]]; then
     # Installed system-wide
     PV_BINARY="/usr/local/bin/packetvelocity"
-    VFLISP_COMPILER="/usr/local/bin/vflispc"
-    VFM_DIS="/usr/local/bin/vfm-dis"
     echo "Using installed PacketVelocity from /usr/local"
 elif [[ -x "$SCRIPT_DIR/packetvelocity" ]]; then
     # Running from source directory
     PV_BINARY="$SCRIPT_DIR/packetvelocity"
-    VFM_DIR="$SCRIPT_DIR/../VelocityFilterMachine"
-    VFLISP_COMPILER="$VFM_DIR/dsl/vflisp/vflispc"
-    VFM_DIS="$VFM_DIR/tools/vfm-dis"
     echo "Using PacketVelocity from source directory"
 else
     echo "Error: PacketVelocity not found in /usr/local/bin or current directory"
@@ -29,18 +24,19 @@ fi
 # Default values
 INTERFACE=""
 EXPRESSION=""
-PACKET_COUNT="10"
+PACKET_COUNT=""
 
 # Function to display usage
 usage() {
     echo "PacketVelocity - High-Performance IPv4/IPv6 Packet Capture"
     echo ""
-    echo "Usage: sudo $0 <interface> \"<vflisp-expression>\" [packet-count]"
+    echo "Usage: sudo $0 <interface> \"<vflisp-expression>\" [packet-count|time-limit]"
     echo ""
     echo "Arguments:"
     echo "  interface         Network interface to capture from (e.g., en0, eth0)"
     echo "  vflisp-expression VFLisp filter expression in quotes"
-    echo "  packet-count      Number of packets to capture (default: 10)"
+    echo "  packet-count      Number of packets to capture (optional)"
+    echo "  time-limit        Maximum time in seconds (optional, use 't:N' format)"
     echo ""
     echo "IPv4 Examples:"
     echo "  sudo $0 en0 \"(= proto 6)\"                    # TCP traffic"
@@ -56,6 +52,10 @@ usage() {
     echo "Mixed IPv4/IPv6 Examples:"
     echo "  sudo $0 en0 \"(or (= src-port 80) (= dst-port 80))\" # HTTP on either IP version"
     echo "  sudo $0 en0 \"(and (= ip-version 6) (= proto 17))\"   # IPv6 UDP traffic"
+    echo ""
+    echo "Limit Examples:"
+    echo "  sudo $0 en0 \"(= proto 6)\" 50                 # Capture 50 TCP packets"
+    echo "  sudo $0 en0 \"(= ip-version 6)\" t:30          # Capture IPv6 for 30 seconds"
     echo ""
     echo "Field Reference:"
     echo "  IPv4 Fields:    src-ip4, dst-ip4, proto, src-port, dst-port"
@@ -74,8 +74,23 @@ fi
 # Parse arguments
 INTERFACE="$1"
 EXPRESSION="$2"
-if [[ -n "$3" ]]; then
-    PACKET_COUNT="$3"
+LIMIT_ARG="$3"
+
+# Parse limit argument (packet count or time limit)
+PACKET_COUNT_ARG=""
+TIME_LIMIT_ARG=""
+if [[ -n "$LIMIT_ARG" ]]; then
+    if [[ "$LIMIT_ARG" =~ ^t:([0-9]+)$ ]]; then
+        # Time limit format: t:30 (30 seconds)
+        TIME_LIMIT_ARG="${BASH_REMATCH[1]}"
+    elif [[ "$LIMIT_ARG" =~ ^[0-9]+$ ]]; then
+        # Packet count format: 10
+        PACKET_COUNT_ARG="$LIMIT_ARG"
+    else
+        echo "Error: Invalid limit format. Use number for packet count or 't:N' for time limit"
+        echo "Examples: 10 (capture 10 packets), t:30 (capture for 30 seconds)"
+        exit 1
+    fi
 fi
 
 # Validate interface
@@ -93,22 +108,11 @@ fi
 # Check for root privileges
 if [[ $EUID -ne 0 ]]; then
     echo "Error: This script must be run as root for packet capture"
-    echo "Usage: sudo $0 $INTERFACE \"$EXPRESSION\" $PACKET_COUNT"
+    echo "Usage: sudo $0 $INTERFACE \"$EXPRESSION\" [limit]"
     exit 1
 fi
 
-# Verify components exist
-if [[ ! -x "$VFLISP_COMPILER" ]]; then
-    echo "Error: VFLisp compiler not found at: $VFLISP_COMPILER"
-    if [[ -n "$VFM_DIR" ]]; then
-        echo "Please build VelocityFilterMachine first:"
-        echo "  cd $VFM_DIR && make all"
-    else
-        echo "Please install VelocityFilterMachine:"
-        echo "  cd VelocityFilterMachine && make install"
-    fi
-    exit 1
-fi
+# Verify PacketVelocity binary exists
 
 if [[ ! -x "$PV_BINARY" ]]; then
     echo "Error: PacketVelocity binary not found at: $PV_BINARY"
@@ -122,52 +126,34 @@ if [[ ! -x "$PV_BINARY" ]]; then
     exit 1
 fi
 
-# Create temporary filter file
-TEMP_FILTER=$(mktemp /tmp/pv_filter.XXXXXX.bin)
-trap "rm -f $TEMP_FILTER" EXIT
-
-echo "PacketVelocity - Compiling VFLisp filter..."
+echo "PacketVelocity - Starting packet capture with VFLisp filter..."
 echo "Interface: $INTERFACE"
 echo "Expression: $EXPRESSION"
-echo "Packet Count: $PACKET_COUNT"
-echo ""
-
-# Compile VFLisp expression to bytecode
-echo "Compiling filter expression..."
-if ! "$VFLISP_COMPILER" -e "$EXPRESSION" -o "$TEMP_FILTER" 2>/dev/null; then
-    echo "Error: Failed to compile VFLisp expression: $EXPRESSION"
-    echo ""
-    echo "Common VFLisp syntax:"
-    echo "  Comparisons: (= field value), (!= field value), (> field value), (< field value)"
-    echo "  Logic:       (and expr1 expr2), (or expr1 expr2), (not expr)"
-    echo "  Fields:      proto, src-port, dst-port, ip-version, src-ip6, dst-ip6"
-    echo ""
-    echo "Example: \"(and (= ip-version 6) (= proto 6))\""
-    exit 1
+if [[ -n "$PACKET_COUNT_ARG" ]]; then
+    echo "Packet Limit: $PACKET_COUNT_ARG"
+elif [[ -n "$TIME_LIMIT_ARG" ]]; then
+    echo "Time Limit: ${TIME_LIMIT_ARG}s"
+else
+    echo "Limit: None (run until Ctrl+C)"
 fi
-
-echo "Filter compiled successfully!"
 echo ""
 
-# Show compiled bytecode information
-echo "Bytecode Information:"
-BYTECODE_SIZE=$(wc -c < "$TEMP_FILTER")
-echo "  Size: $BYTECODE_SIZE bytes"
-
-# Optional: Show disassembly if available
-if [[ -x "$VFM_DIS" ]]; then
-    echo "  Disassembly:"
-    "$VFM_DIS" "$TEMP_FILTER" 2>/dev/null | head -10 | sed 's/^/    /'
-fi
-
-echo ""
 echo "Starting packet capture on $INTERFACE..."
 echo "Filter: $EXPRESSION"
 echo "Press Ctrl+C to stop capture early"
 echo ""
 
+# Build PacketVelocity command with VFLisp expression directly
+PV_ARGS=("-i" "$INTERFACE" "-l" "$EXPRESSION" "-v")
+
+if [[ -n "$PACKET_COUNT_ARG" ]]; then
+    PV_ARGS+=("--packet-num" "$PACKET_COUNT_ARG")
+elif [[ -n "$TIME_LIMIT_ARG" ]]; then
+    PV_ARGS+=("--seconds-num" "$TIME_LIMIT_ARG")
+fi
+
 # Run PacketVelocity with the compiled filter
-"$PV_BINARY" -i "$INTERFACE" -f "$TEMP_FILTER" -c "$PACKET_COUNT" -v
+"$PV_BINARY" "${PV_ARGS[@]}"
 
 echo ""
 echo "Capture completed."

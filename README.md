@@ -32,6 +32,12 @@ I have gotten it to run and log packets to stdout but beyond that you may be in 
 - ARM64 JIT compilation for IPv6 operations
 - Enhanced verifier for IPv6 safety
 
+**Performance Features:**
+- ARM64 JIT compilation with NEON 128-bit operations
+- Direct VFLisp expression processing (no intermediate files)
+- High-performance packet capture with filtering
+- Flexible capture limits (packet count or time-based)
+
 **Platform Support:**
 
 **macOS Features:**
@@ -83,7 +89,7 @@ yum install libxdp-devel libbpf-devel
 The easiest way to use PacketVelocity is with the included `pcv.sh` script, which works both from source and when installed system-wide:
 
 ```bash
-# IPv4 Examples
+# Basic Usage (runs until Ctrl+C)
 sudo ./pcv.sh en0 "(= proto 6)"                    # TCP traffic
 sudo ./pcv.sh en0 "(= dst-port 443)"               # HTTPS traffic
 sudo ./pcv.sh en0 "(and (= proto 6) (= dst-port 80))" # HTTP traffic
@@ -98,25 +104,34 @@ sudo ./pcv.sh en0 "(and (= proto 6) (!= dst-ip6 ::))" # IPv6 TCP non-null destin
 sudo ./pcv.sh en0 "(or (= src-port 80) (= dst-port 80))" # HTTP on either IP version
 sudo ./pcv.sh en0 "(and (= ip-version 6) (= proto 17))"   # IPv6 UDP traffic
 
-# Capture more packets
+# With Limits
 sudo ./pcv.sh en0 "(= proto 6)" 50                 # Capture 50 TCP packets
+sudo ./pcv.sh en0 "(= ip-version 6)" t:30          # Capture IPv6 for 30 seconds
 ```
 
-The `pcv.sh` script automatically detects whether PacketVelocity is installed in `/usr/local` or running from source.
+**Key Features:**
+- **Direct VFLisp processing** - expressions are compiled and JIT-optimized internally
+- **Automatic installation detection** - works from `/usr/local` or source directory
+- **Flexible capture limits** - packet count, time limit, or unlimited
+- **High performance** - utilizes ARM64 JIT compilation for IPv6 operations
 
 ### Direct Binary Usage
 ```bash
-# Basic capture on interface
+# Basic capture on interface (unlimited)
 sudo ./packetvelocity -i en0     # macOS
 sudo ./packetvelocity -i eth0    # Linux
 
-# Capture with verbose output
-sudo ./packetvelocity -i en0 -v
+# With VFLisp filter expression (enables JIT)
+sudo ./packetvelocity -i en0 -l "(= proto 6)" -v
+
+# With packet or time limits
+sudo ./packetvelocity -i en0 -l "(= ip-version 6)" --packet-num 100
+sudo ./packetvelocity -i en0 -l "(= dst-port 443)" --seconds-num 30
 
 # Enable promiscuous and immediate mode
 sudo ./packetvelocity -i en0 -p -I
 
-# With pre-compiled VFM filter
+# With pre-compiled VFM filter (bypasses JIT)
 sudo ./packetvelocity -i en0 -f myfilter.bin
 ```
 
@@ -135,6 +150,19 @@ gcc examples/simple_capture.c -I./include -L. -lpacketvelocity -o simple_capture
 
 # Linux NUMA demo (Linux only)
 gcc examples/linux_numa_demo.c -I./include -L. -lpacketvelocity -o numa_demo
+```
+
+### pcv.sh Script Usage
+The `pcv.sh` script provides an easy interface for VFLisp filtering:
+
+```bash
+# Script syntax
+sudo ./pcv.sh <interface> "<vflisp-expression>" [packet-count|time-limit]
+
+# Examples
+sudo ./pcv.sh en0 "(= proto 6)"                    # Run until Ctrl+C
+sudo ./pcv.sh en0 "(= ip-version 6)" 100           # Capture 100 IPv6 packets  
+sudo ./pcv.sh en0 "(= dst-port 443)" t:60          # Capture HTTPS for 60 seconds
 ```
 
 ## Next Steps
