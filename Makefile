@@ -1,7 +1,15 @@
 # PacketVelocity Makefile
 # High-performance packet capture library
 
+# Platform detection
+UNAME_S := $(shell uname -s)
+
+# Compiler selection - use GCC on Linux for better compatibility with VFM
+ifeq ($(UNAME_S),Linux)
+CC = gcc
+else
 CC = clang
+endif
 CFLAGS = -Wall -Wextra -O3 -std=c11
 DEBUG_FLAGS = -g -O0 -DDEBUG
 
@@ -18,10 +26,7 @@ MACOS_LDFLAGS =
 
 # Linux specific flags
 LINUX_CFLAGS = -DPLATFORM_LINUX
-LINUX_LDFLAGS = 
-
-# Platform detection
-UNAME_S := $(shell uname -s)
+LINUX_LDFLAGS =
 
 # RistrettoDB support (optional)
 HAVE_RISTRETTO ?= 0
