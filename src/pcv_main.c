@@ -19,8 +19,11 @@
 static pcv_handle* g_handle = NULL;
 static volatile int g_running = 1;
 
-/* Packet counter */
+/* Packet counter and limits */
 static uint64_t g_packet_count = 0;
+static uint64_t g_packet_limit = 0;  /* 0 = unlimited */
+static time_t g_start_time = 0;
+static uint32_t g_time_limit = 0;    /* 0 = unlimited */
 
 /* Structure to pass filter and local addresses to callback */
 typedef struct {
@@ -199,6 +202,25 @@ static void packet_callback(const pcv_packet* packet, void* user_data) {
     
     g_packet_count++;
     
+    /* Check packet limit */
+    if (g_packet_limit > 0 && g_packet_count >= g_packet_limit) {
+        g_running = 0;
+        if (g_handle) {
+            pcv_breakloop(g_handle);
+        }
+    }
+    
+    /* Check time limit */
+    if (g_time_limit > 0 && g_start_time > 0) {
+        time_t current_time = time(NULL);
+        if (current_time - g_start_time >= g_time_limit) {
+            g_running = 0;
+            if (g_handle) {
+                pcv_breakloop(g_handle);
+            }
+        }
+    }
+    
     /* Format timestamp and packet info with direction */
     format_timestamp(packet->timestamp_ns, timestamp, sizeof(timestamp));
     uint32_t local_ip = ctx ? ctx->local_ip : 0;
@@ -221,6 +243,8 @@ static void print_usage(const char* program) {
     printf("  -p, --promiscuous         Enable promiscuous mode\n");
     printf("  -I, --immediate           Enable immediate mode (low latency)\n");
     printf("  -b, --buffer-size <size>  Set buffer size (default: 4MB)\n");
+    printf("  -c, --packet-num <count>  Stop after capturing <count> packets\n");
+    printf("  -t, --seconds-num <secs>  Stop after <secs> seconds\n");
     printf("  -v, --verbose             Enable verbose output\n");
     printf("  -V, --version             Show version information\n");
     printf("  -h, --help                Show this help message\n");
@@ -293,6 +317,8 @@ int main(int argc, char* argv[]) {
         {"promiscuous", no_argument, 0, 'p'},
         {"immediate", no_argument, 0, 'I'},
         {"buffer-size", required_argument, 0, 'b'},
+        {"packet-num", required_argument, 0, 'c'},
+        {"seconds-num", required_argument, 0, 't'},
         {"verbose", no_argument, 0, 'v'},
         {"version", no_argument, 0, 'V'},
         {"help", no_argument, 0, 'h'},
@@ -301,7 +327,7 @@ int main(int argc, char* argv[]) {
     
     /* Parse command line */
     int opt;
-    while ((opt = getopt_long(argc, argv, "i:f:l:pIb:vVh", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:f:l:pIb:c:t:vVh", long_options, NULL)) != -1) {
         switch (opt) {
         case 'i':
             interface = optarg;
@@ -320,6 +346,12 @@ int main(int argc, char* argv[]) {
             break;
         case 'b':
             buffer_size = atoi(optarg);
+            break;
+        case 'c':
+            g_packet_limit = strtoull(optarg, NULL, 10);
+            break;
+        case 't':
+            g_time_limit = atoi(optarg);
             break;
         case 'v':
             verbose = true;
@@ -436,6 +468,9 @@ int main(int argc, char* argv[]) {
     /* Store interface name for IPv6 direction detection */
     strncpy(ctx.interface_name, interface, sizeof(ctx.interface_name) - 1);
     ctx.interface_name[sizeof(ctx.interface_name) - 1] = '\0';
+    
+    /* Initialize start time for time limit */
+    g_start_time = time(NULL);
     
     /* Start capture */
     int result = pcv_capture(g_handle, packet_callback, &ctx);
