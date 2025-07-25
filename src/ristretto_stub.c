@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L  /* For strdup */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,7 +24,7 @@ typedef struct {
         int64_t integer;
         double real;
         struct {
-            const char *data;
+            char *data;
             size_t length;
         } text;
     } value;
