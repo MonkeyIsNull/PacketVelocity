@@ -18,9 +18,30 @@
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include <netinet/in.h>
-#include <linux/if_packet.h>
-#include <linux/if_ether.h>
 #include <arpa/inet.h>
+
+/* Include packet socket headers with fallbacks for musl/Alpine */
+#ifdef __has_include
+#if __has_include(<linux/if_packet.h>)
+#include <linux/if_packet.h>
+#else
+#include <netpacket/packet.h>
+#endif
+#if __has_include(<linux/if_ether.h>)
+#include <linux/if_ether.h>
+#else
+#include <net/ethernet.h>
+#endif
+#else
+/* Fallback for older compilers */
+#include <netpacket/packet.h>
+#include <net/ethernet.h>
+#endif
+
+/* Define ETH_P_ALL if not available */
+#ifndef ETH_P_ALL
+#define ETH_P_ALL 0x0003
+#endif
 
 /* Get interface index */
 int pcv_raw_get_ifindex(const char* interface) {
