@@ -13,7 +13,7 @@
 #ifdef PCV_PLATFORM_MACOS
 #include "pcv_bpf_macos.h"
 #elif defined(PCV_PLATFORM_LINUX)
-#include "pcv_xdp_linux.h"
+#include "pcv_raw_linux.h"
 #endif
 
 /* Platform implementation selector */

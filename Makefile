@@ -18,7 +18,7 @@ MACOS_LDFLAGS =
 
 # Linux specific flags
 LINUX_CFLAGS = -DPLATFORM_LINUX
-LINUX_LDFLAGS = -lxdp -lbpf 
+LINUX_LDFLAGS = 
 
 # Platform detection
 UNAME_S := $(shell uname -s)
@@ -98,7 +98,7 @@ ifeq ($(UNAME_S),Darwin)
     CFLAGS += $(MACOS_CFLAGS)
     LDFLAGS += $(MACOS_LDFLAGS)
 else ifeq ($(UNAME_S),Linux)
-    SOURCES += src/pcv_xdp_linux.c
+    SOURCES += src/pcv_raw_linux.c
     CFLAGS += $(LINUX_CFLAGS)
     LDFLAGS += $(LINUX_LDFLAGS)
 endif

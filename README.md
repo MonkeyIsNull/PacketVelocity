@@ -48,12 +48,11 @@ I have gotten it to run and log packets to stdout but beyond that you may be in 
 - Promiscuous mode support
 
 **Linux Features:**
-- AF_XDP socket support with zero-copy
-- NUMA-aware memory allocation
-- CPU core pinning
-- Hardware offload capabilities
-- XDP program management
-- Batch packet processing
+- Raw socket packet capture with promiscuous mode
+- Standard Linux socket API (no external dependencies)
+- VFM-based userspace filtering
+
+**Note:** XDP/AF_XDP support has been removed in the current release to focus on VelocityFilterMachine-based filtering. XDP support is planned for a future release.
 
 ## Building
 
@@ -73,15 +72,7 @@ sudo make install  # Installs to /usr/local/bin
 ## Dependencies
 
 **macOS:** No external dependencies
-**Linux:** libxdp, libbpf (optional - stubs provided)
-
-```bash
-# Ubuntu/Debian
-apt install libxdp-dev libbpf-dev
-
-# RHEL/CentOS
-yum install libxdp-devel libbpf-devel
-```
+**Linux:** No external dependencies (uses standard raw sockets)
 
 ## Usage
 
@@ -140,7 +131,7 @@ sudo ./packetvelocity -i en0 -f myfilter.bin
 | Platform | Target | Packet Size | Status |
 |----------|--------|-------------|---------|
 | macOS BPF | 500K-1M pps | 64 byte | Implemented |
-| Linux AF_XDP | 5-10M pps | 64 byte | Implemented (stub) |
+| Linux Raw Sockets | 100K-500K pps | 64 byte | Implemented |
 
 ## Examples
 
@@ -171,9 +162,9 @@ sudo ./pcv.sh en0 "(= dst-port 443)" t:60          # Capture HTTPS for 60 second
 PacketVelocity
 ├── Platform Interface (abstract)
 │   ├── macOS: BPF + mmap (implemented)
-│   └── Linux: AF_XDP + zero-copy (implemented)
+│   └── Linux: Raw sockets + VFM filtering (implemented)
 ├── Ring Buffer Manager (implemented)
-├── Filter Engine (VFM stub)
+├── Filter Engine (VFM with IPv6 support)
 └── Output Plugins (RistrettoDB stub)
 ```
 
@@ -196,21 +187,22 @@ int pcv_capture_batch(pcv_handle* h, pcv_batch_callback cb, void* user);
 pcv_stats* pcv_get_stats(pcv_handle* h);
 ```
 
-## Linux AF_XDP Features
+## Linux Raw Socket Features
 
-- **Zero-copy packet access** via UMEM
-- **NUMA-aware allocation** for optimal memory placement
-- **CPU affinity control** for performance tuning
-- **Hardware offload** support where available
-- **Batch processing** for high throughput
-- **XDP program management** for kernel-space filtering
+- **Standard raw socket packet capture** using AF_PACKET
+- **Promiscuous mode support** for complete packet visibility
+- **VFM userspace filtering** with IPv6 support and JIT compilation
+- **No external dependencies** - uses kernel-provided socket API
+- **Root privileges required** for raw socket access
 
-## Dependencies
+## Core Dependencies
 
-- macOS: VFM and possibly RistrettoDB
-- Linux: libxdp, libbpf (optional - stubs provided)
-- VFM: [VelocityFilterMachine](https://github.com/MonkeyIsNull/VelocityFilterMachine) with complete IPv6 support
-- RistrettoDB: https://github.com/MonkeyIsNull/RistrettoDB (stubbed - not tested)
+- **VFM**: [VelocityFilterMachine](https://github.com/MonkeyIsNull/VelocityFilterMachine) with complete IPv6 support and JIT compilation
+- **RistrettoDB**: https://github.com/MonkeyIsNull/RistrettoDB (optional - stubbed if not available)
+
+**Platform Dependencies:**
+- macOS: No external dependencies (uses BSD/Darwin BPF)
+- Linux: No external dependencies (uses standard raw sockets)
 
 ## IPv6 Support
 
