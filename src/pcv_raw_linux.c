@@ -219,6 +219,8 @@ static int linux_capture(pcv_handle* handle, pcv_callback callback, void* user_d
 static int linux_capture_batch(pcv_handle* handle, pcv_batch_callback callback, void* user_data) {
     pcv_raw_handle* raw_handle = (pcv_raw_handle*)handle;
     
+    (void)user_data;  /* Unused parameter */
+    
     if (!raw_handle || !callback) {
         return -PCV_ERROR_INVALID_ARG;
     }

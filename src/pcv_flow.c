@@ -72,7 +72,7 @@ int pcv_flow_extract_key(const pcv_packet* packet, pcv_flow_key* key) {
     /* Extract ports for TCP/UDP */
     if (key->protocol == 6 || key->protocol == 17) {  /* TCP or UDP */
         uint8_t ip_header_len = (ip_header[0] & 0x0F) * 4;
-        if (len >= 14 + ip_header_len + 4) {
+        if (len >= (uint32_t)(14 + ip_header_len + 4)) {
             const uint8_t* transport_header = ip_header + ip_header_len;
             memcpy(&key->src_port, transport_header, 2);
             memcpy(&key->dst_port, transport_header + 2, 2);
@@ -243,7 +243,7 @@ int pcv_flow_update(pcv_flow_table* table, const pcv_packet* packet) {
     if (key.protocol == 6 && packet->captured_length >= 34) {  /* TCP */
         const uint8_t* ip_header = packet->data + 14;
         uint8_t ip_header_len = (ip_header[0] & 0x0F) * 4;
-        if (packet->captured_length >= 14 + ip_header_len + 14) {
+        if (packet->captured_length >= (uint32_t)(14 + ip_header_len + 14)) {
             const uint8_t* tcp_header = ip_header + ip_header_len;
             uint8_t tcp_flags = tcp_header[13];
             flow->tcp_flags |= tcp_flags;
@@ -395,8 +395,8 @@ int pcv_parse_ipv6_ext_headers(const pcv_packet* packet, pcv_ipv6_ext_headers* e
     ext_info->final_protocol = next_header;
     
     /* Parse extension headers */
-    while (is_ipv6_extension_header(next_header) && (14 + offset) < len) {
-        if ((14 + offset + 2) > len) {
+    while (is_ipv6_extension_header(next_header) && (uint32_t)(14 + offset) < len) {
+        if ((uint32_t)(14 + offset + 2) > len) {
             break;  /* Not enough data for extension header */
         }
         
@@ -489,7 +489,7 @@ int pcv_flow_extract_key_v6(const pcv_packet* packet, pcv_flow_key_v6* key) {
         /* Extract ports for TCP/UDP */
         if (key->protocol == 6 || key->protocol == 17) {  /* TCP or UDP */
             uint8_t ip_header_len = (ip_header[0] & 0x0F) * 4;
-            if (len >= 14 + ip_header_len + 4) {
+            if (len >= (uint32_t)(14 + ip_header_len + 4)) {
                 const uint8_t* transport_header = ip_header + ip_header_len;
                 key->src_port = ntohs(*(uint16_t*)transport_header);
                 key->dst_port = ntohs(*(uint16_t*)(transport_header + 2));
@@ -513,8 +513,8 @@ int pcv_flow_extract_key_v6(const pcv_packet* packet, pcv_flow_key_v6* key) {
         uint16_t offset = 40;  /* IPv6 header is fixed 40 bytes */
         
         /* Skip extension headers to find final protocol */
-        while (is_ipv6_extension_header(next_header) && (14 + offset) < len) {
-            if ((14 + offset + 2) > len) {
+        while (is_ipv6_extension_header(next_header) && (uint32_t)(14 + offset) < len) {
+            if ((uint32_t)(14 + offset + 2) > len) {
                 break;  /* Not enough data for extension header */
             }
             
@@ -532,7 +532,7 @@ int pcv_flow_extract_key_v6(const pcv_packet* packet, pcv_flow_key_v6* key) {
         key->protocol = next_header;
         
         /* Extract ports for TCP/UDP */
-        if ((next_header == 6 || next_header == 17) && (14 + offset + 4) <= len) {
+        if ((next_header == 6 || next_header == 17) && (uint32_t)(14 + offset + 4) <= len) {
             const uint8_t* transport_header = ip_header + offset;
             key->src_port = ntohs(*(uint16_t*)transport_header);
             key->dst_port = ntohs(*(uint16_t*)(transport_header + 2));
