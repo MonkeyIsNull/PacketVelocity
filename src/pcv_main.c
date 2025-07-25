@@ -1,3 +1,15 @@
+#ifdef __linux__
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L  /* For getopt_long and other POSIX functions */
+#endif
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE  /* For additional system functions */
+#endif
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE  /* For getopt_long on some systems */
+#endif
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

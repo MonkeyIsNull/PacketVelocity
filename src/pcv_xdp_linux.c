@@ -1,3 +1,12 @@
+#ifdef __linux__
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L  /* For usleep, strdup, and other POSIX functions */
+#endif
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE  /* For additional system functions */
+#endif
+#endif
+
 #include "pcv_xdp_linux.h"
 #include "pcv_platform.h"
 #include <stdio.h>
@@ -24,32 +33,7 @@
 #include <xdp/xsk.h>
 #include <bpf/libbpf.h>
 #else
-/* Stub structures when libxdp is not available */
-struct xsk_ring_prod {
-    uint32_t cached_prod;
-    uint32_t cached_cons;
-    uint32_t mask;
-    uint32_t size;
-    uint32_t *producer;
-    void *ring;
-    uint32_t *consumer;
-    void *map;
-    int ring_size;
-};
-
-struct xsk_ring_cons {
-    uint32_t cached_prod;
-    uint32_t cached_cons;
-    uint32_t mask;
-    uint32_t size;
-    uint32_t *producer;
-    void *ring;
-    uint32_t *consumer;
-    void *map;
-    int ring_size;
-};
-
-/* Stub XDP descriptor */
+/* Stub XDP descriptor when libxdp is not available */
 struct xdp_desc {
     uint64_t addr;
     uint32_t len;
@@ -93,7 +77,16 @@ void* pcv_xdp_alloc_numa(size_t size, int numa_node) {
     (void)numa_node;
     
     /* Align to page boundary for better performance */
-    void* ptr = aligned_alloc(4096, (size + 4095) & ~4095);
+    void* ptr = NULL;
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__)
+    ptr = aligned_alloc(4096, (size + 4095) & ~4095);
+#elif defined(__linux__) || defined(_POSIX_C_SOURCE)
+    if (posix_memalign(&ptr, 4096, (size + 4095) & ~4095) != 0) {
+        ptr = NULL;
+    }
+#else
+    ptr = malloc((size + 4095) & ~4095);
+#endif
     if (ptr) {
         memset(ptr, 0, size);
     }

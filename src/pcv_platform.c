@@ -1,3 +1,12 @@
+#ifdef __linux__
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L  /* For strdup and other POSIX functions */
+#endif
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE  /* For additional system functions */
+#endif
+#endif
+
 #include "pcv_platform.h"
 #include "pcv.h"
 
