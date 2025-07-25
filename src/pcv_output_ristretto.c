@@ -1,8 +1,11 @@
+#define _POSIX_C_SOURCE 200809L  /* For strdup */
 #include "pcv_output.h"
 #include "pcv_flow.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <inttypes.h>
 #include <time.h>
 #include <arpa/inet.h>
 
@@ -111,7 +114,7 @@ static int insert_flow_to_database(pcv_ristretto_context* ctx, const pcv_flow_st
         "first_seen, last_seen, duration_ms, packet_count, byte_count, tcp_flags, flow_state"
         ") VALUES ("
         "%u, '%s', '%s', %u, %u, %u, "
-        "%llu, %llu, %llu, %llu, %llu, %u, %u"
+        "%" PRIu64 ", %" PRIu64 ", %" PRIu64 ", %" PRIu64 ", %" PRIu64 ", %u, %u"
         ")",
         flow->flow_id, src_ip_str, dst_ip_str,
         flow->key.src_port, flow->key.dst_port, flow->key.protocol,
@@ -235,7 +238,7 @@ pcv_output* pcv_output_create(pcv_output_type type, const char* target) {
     printf("RistrettoDB database initialized: %s\n", ctx->database_file);
     printf("Flow table capacity: %u flows, %u buckets\n", 
            ctx->flow_config.max_flows, ctx->flow_config.hash_buckets);
-    printf("Flush configuration: batch_size=%u, interval=%llu ms\n",
+    printf("Flush configuration: batch_size=%u, interval=%" PRIu64 " ms\n",
            ctx->batch_size, ctx->flush_interval_ns / 1000000ULL);
     
     return output;
@@ -269,9 +272,9 @@ void pcv_output_destroy(pcv_output* output) {
         }
         
         printf("RistrettoDB statistics:\n");
-        printf("  Total inserts: %llu\n", ctx->total_inserts);
-        printf("  Total flushes: %llu\n", ctx->total_flushes);
-        printf("  Insert errors: %llu\n", ctx->insert_errors);
+        printf("  Total inserts: %" PRIu64 "\n", ctx->total_inserts);
+        printf("  Total flushes: %" PRIu64 "\n", ctx->total_flushes);
+        printf("  Insert errors: %" PRIu64 "\n", ctx->insert_errors);
         
         free(ctx->database_file);
         free(ctx);
