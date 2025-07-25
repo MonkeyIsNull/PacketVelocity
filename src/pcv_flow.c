@@ -316,14 +316,13 @@ int pcv_flow_iterate(pcv_flow_table* table, pcv_flow_iterator callback, void* us
 /* Check if protocol is an IPv6 extension header */
 static bool is_ipv6_extension_header(uint8_t protocol) {
     switch (protocol) {
-        case 0:   /* Hop-by-Hop Options */
-        case 6:   /* TCP (final destination) */
-        case 17:  /* UDP (final destination) */
+        case 0:   /* Hop-by-Hop Options Header */
         case 43:  /* Routing Header */
         case 44:  /* Fragment Header */
-        case 58:  /* ICMPv6 */
-        case 60:  /* Destination Options */
-            return (protocol != 6 && protocol != 17 && protocol != 58);
+        case 51:  /* Authentication Header */
+        case 60:  /* Destination Options Header */
+        case 135: /* Mobility Header */
+            return true;
         default:
             return false;
     }
@@ -332,16 +331,120 @@ static bool is_ipv6_extension_header(uint8_t protocol) {
 /* Get length of IPv6 extension header */
 static uint16_t get_ipv6_extension_header_length(uint8_t protocol, const uint8_t* header) {
     switch (protocol) {
-        case 0:   /* Hop-by-Hop Options */
-        case 60:  /* Destination Options */
-            return (header[1] + 1) * 8;  /* Length field in 8-byte units */
-        case 43:  /* Routing Header */
+        case 0:   /* Hop-by-Hop Options Header */
+        case 60:  /* Destination Options Header */
+            /* Length is in 8-byte units, excluding first 8 bytes */
             return (header[1] + 1) * 8;
+            
+        case 43:  /* Routing Header */
+            /* Length is in 8-byte units, excluding first 8 bytes */
+            return (header[1] + 1) * 8;
+            
         case 44:  /* Fragment Header */
-            return 8;  /* Fixed length */
+            /* Fixed length of 8 bytes */
+            return 8;
+            
+        case 51:  /* Authentication Header */
+            /* Length is in 4-byte units, excluding first 2 units (8 bytes) */
+            return (header[1] + 2) * 4;
+            
+        case 135: /* Mobility Header */
+            /* Length field is total header length minus 8 bytes */
+            return header[1] + 8;
+            
         default:
-            return 0;
+            return 0;  /* Unknown extension header */
     }
+}
+
+/* Parse IPv6 extension headers and extract detailed information */
+int pcv_parse_ipv6_ext_headers(const pcv_packet* packet, pcv_ipv6_ext_headers* ext_info) {
+    const uint8_t* data = packet->data;
+    uint32_t len = packet->captured_length;
+    
+    /* Clear extension header info */
+    memset(ext_info, 0, sizeof(pcv_ipv6_ext_headers));
+    
+    /* Need at least Ethernet + IPv6 header */
+    if (len < 54) {
+        return -1;
+    }
+    
+    /* Skip Ethernet header (14 bytes) */
+    const uint8_t* ip_header = data + 14;
+    
+    /* Check IP version - must be IPv6 */
+    uint8_t version = (ip_header[0] >> 4) & 0x0F;
+    if (version != 6) {
+        return -1;  /* Not IPv6 */
+    }
+    
+    /* Start parsing from IPv6 next header field */
+    uint8_t next_header = ip_header[6];
+    uint16_t offset = 40;  /* IPv6 header is fixed 40 bytes */
+    
+    ext_info->final_protocol = next_header;
+    
+    /* Parse extension headers */
+    while (is_ipv6_extension_header(next_header) && (14 + offset) < len) {
+        if ((14 + offset + 2) > len) {
+            break;  /* Not enough data for extension header */
+        }
+        
+        const uint8_t* ext_header = ip_header + offset;
+        uint16_t ext_len = get_ipv6_extension_header_length(next_header, ext_header);
+        
+        if (ext_len == 0 || (offset + ext_len) > (len - 14)) {
+            break;  /* Invalid extension header */
+        }
+        
+        ext_info->has_ext_headers = 1;
+        ext_info->ext_header_count++;
+        ext_info->total_ext_length += ext_len;
+        
+        /* Handle specific extension header types */
+        switch (next_header) {
+            case 44: /* Fragment Header */
+                /* Extract fragment information */
+                if (ext_len >= 8) {
+                    /* Fragment header format:
+                     * 0: Next Header
+                     * 1: Reserved
+                     * 2-3: Fragment Offset and Flags (network byte order)
+                     * 4-7: Identification (network byte order)
+                     */
+                    uint16_t frag_info = ntohs(*(uint16_t*)(ext_header + 2));
+                    ext_info->fragment_offset = (frag_info >> 3) & 0x1FFF;  /* 13 bits */
+                    ext_info->fragment_flags = frag_info & 0x0007;          /* 3 bits */
+                    ext_info->fragment_id = ntohl(*(uint32_t*)(ext_header + 4));
+                }
+                break;
+                
+            case 51: /* Authentication Header */
+                /* AH has variable length based on authentication data */
+                break;
+                
+            case 0:   /* Hop-by-Hop Options */
+            case 60:  /* Destination Options */
+                /* Options headers contain variable TLV options */
+                break;
+                
+            case 43:  /* Routing Header */
+                /* Routing header contains routing information */
+                break;
+                
+            case 135: /* Mobility Header */
+                /* Mobile IPv6 header */
+                break;
+        }
+        
+        /* Move to next header */
+        next_header = ext_header[0];
+        offset += ext_len;
+        ext_info->final_protocol = next_header;
+    }
+    
+    return 0;
 }
 
 /* Extract flow key from packet with IPv4/IPv6 support */

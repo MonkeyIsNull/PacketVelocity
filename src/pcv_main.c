@@ -26,7 +26,7 @@ static uint64_t g_packet_count = 0;
 typedef struct {
     pcv_filter* filter;
     uint32_t local_ip;
-    uint8_t local_ipv6[16];
+    char interface_name[32];
     bool has_ipv6;
 } callback_context;
 
@@ -90,11 +90,11 @@ static uint32_t get_interface_ip(const char* interface_name) {
     return local_ip;
 }
 
-/* Get local IPv6 address of interface */
-static bool get_interface_ipv6(const char* interface_name, uint8_t* ipv6_addr) {
+/* Check if IPv6 address belongs to interface (checks all addresses) */
+static bool is_local_ipv6(const char* interface_name, const uint8_t* test_addr) {
     struct ifaddrs *ifaddrs_ptr = NULL;
     struct ifaddrs *ifa = NULL;
-    bool found = false;
+    bool is_local = false;
     
     if (getifaddrs(&ifaddrs_ptr) == -1) {
         return false;
@@ -107,25 +107,23 @@ static bool get_interface_ipv6(const char* interface_name, uint8_t* ipv6_addr) {
             strcmp(ifa->ifa_name, interface_name) == 0) {
             struct sockaddr_in6* addr_in6 = (struct sockaddr_in6*)ifa->ifa_addr;
             
-            /* Skip link-local addresses */
-            if (!IN6_IS_ADDR_LINKLOCAL(&addr_in6->sin6_addr)) {
-                memcpy(ipv6_addr, &addr_in6->sin6_addr, 16);
-                found = true;
+            /* Check against all IPv6 addresses (including temporary/privacy addresses) */
+            if (memcmp(&addr_in6->sin6_addr, test_addr, 16) == 0) {
+                is_local = true;
                 break;
             }
         }
     }
     
     freeifaddrs(ifaddrs_ptr);
-    return found;
+    return is_local;
 }
 
 /* Format packet information with directional arrows and IPv6 support */
-static void format_packet_info(const pcv_packet* packet, uint32_t local_ip, const uint8_t* local_ipv6, char* buffer, size_t size) {
+static void format_packet_info(const pcv_packet* packet, uint32_t local_ip, const char* interface_name, char* buffer, size_t size) {
     pcv_flow_key_v6 key;
     char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
     bool is_outgoing;
-    const char* arrow;
     
     /* Extract flow key from packet using IPv6-capable parser */
     if (pcv_flow_extract_key_v6(packet, &key) != 0) {
@@ -141,35 +139,34 @@ static void format_packet_info(const pcv_packet* packet, uint32_t local_ip, cons
         inet_ntop(AF_INET, &key.dst_ip.ipv4, dst_ip, sizeof(dst_ip));
         is_outgoing = (ntohl(key.src_ip.ipv4) == local_ip);
     } else if (key.addr_family == PCV_ADDR_IPV6) {
-        /* IPv6 packet */
+        /* IPv6 packet - check if source address is local to this interface */
         inet_ntop(AF_INET6, key.src_ip.ipv6, src_ip, sizeof(src_ip));
         inet_ntop(AF_INET6, key.dst_ip.ipv6, dst_ip, sizeof(dst_ip));
-        is_outgoing = (local_ipv6 && memcmp(key.src_ip.ipv6, local_ipv6, 16) == 0);
+        is_outgoing = is_local_ipv6(interface_name, key.src_ip.ipv6);
     } else {
         snprintf(buffer, size, "[unknown IP version %u, %u bytes]", key.addr_family, packet->captured_length);
         return;
     }
     
-    arrow = is_outgoing ? ">" : "<";
-    const char* ip_version = (key.addr_family == PCV_ADDR_IPV6) ? "6" : "";
+    const char* ip_version = (key.addr_family == PCV_ADDR_IPV6) ? "IPv6" : "IPv4";
     
-    /* Format with directional arrows */
+    /* Always use tcpdump standard: source > destination */
     if (key.protocol == 6 || key.protocol == 17) {
         /* TCP or UDP with ports */
         const char* direction = is_outgoing ? "OUT" : "IN ";
         if (key.addr_family == PCV_ADDR_IPV6) {
             /* IPv6 addresses need brackets for port notation */
-            snprintf(buffer, size, "%s IP%s [%s].%u %s [%s].%u: %s %u",
+            snprintf(buffer, size, "%s %s [%s].%u > [%s].%u: %s %u",
                      direction, ip_version,
-                     src_ip, key.src_port, arrow,
+                     src_ip, key.src_port,
                      dst_ip, key.dst_port,
                      protocol_to_string(key.protocol),
                      packet->captured_length);
         } else {
             /* IPv4 standard notation */
-            snprintf(buffer, size, "%s IP%s %s.%u %s %s.%u: %s %u",
+            snprintf(buffer, size, "%s %s %s.%u > %s.%u: %s %u",
                      direction, ip_version,
-                     src_ip, key.src_port, arrow,
+                     src_ip, key.src_port,
                      dst_ip, key.dst_port,
                      protocol_to_string(key.protocol),
                      packet->captured_length);
@@ -177,9 +174,9 @@ static void format_packet_info(const pcv_packet* packet, uint32_t local_ip, cons
     } else {
         /* Other protocols without ports */
         const char* direction = is_outgoing ? "OUT" : "IN ";
-        snprintf(buffer, size, "%s IP%s %s %s %s: %s %u",
+        snprintf(buffer, size, "%s %s %s > %s: %s %u",
                  direction, ip_version,
-                 src_ip, arrow, dst_ip,
+                 src_ip, dst_ip,
                  protocol_to_string(key.protocol),
                  packet->captured_length);
     }
@@ -205,8 +202,8 @@ static void packet_callback(const pcv_packet* packet, void* user_data) {
     /* Format timestamp and packet info with direction */
     format_timestamp(packet->timestamp_ns, timestamp, sizeof(timestamp));
     uint32_t local_ip = ctx ? ctx->local_ip : 0;
-    const uint8_t* local_ipv6 = (ctx && ctx->has_ipv6) ? ctx->local_ipv6 : NULL;
-    format_packet_info(packet, local_ip, local_ipv6, packet_info, sizeof(packet_info));
+    const char* interface_name = (ctx && ctx->has_ipv6) ? ctx->interface_name : "";
+    format_packet_info(packet, local_ip, interface_name, packet_info, sizeof(packet_info));
     
     /* Print tcpdump-style output */
     printf("%s %s\n", timestamp, packet_info);
@@ -428,19 +425,17 @@ int main(int argc, char* argv[]) {
     
     /* Get local addresses for directional packet display */
     uint32_t local_ip = get_interface_ip(interface);
-    uint8_t local_ipv6[16];
-    bool has_ipv6 = get_interface_ipv6(interface, local_ipv6);
     
     /* Create callback context with filter and local addresses */
     callback_context ctx = {
         .filter = filter,
         .local_ip = local_ip,
-        .has_ipv6 = has_ipv6
+        .has_ipv6 = true  // Enable IPv6 direction detection
     };
     
-    if (has_ipv6) {
-        memcpy(ctx.local_ipv6, local_ipv6, 16);
-    }
+    /* Store interface name for IPv6 direction detection */
+    strncpy(ctx.interface_name, interface, sizeof(ctx.interface_name) - 1);
+    ctx.interface_name[sizeof(ctx.interface_name) - 1] = '\0';
     
     /* Start capture */
     int result = pcv_capture(g_handle, packet_callback, &ctx);

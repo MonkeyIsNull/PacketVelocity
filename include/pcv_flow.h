@@ -35,6 +35,21 @@ typedef struct pcv_flow_key_v6 {
     uint16_t reserved;      /* Padding for alignment */
 } pcv_flow_key_v6;
 
+/* IPv6 extension header parsing information */
+typedef struct pcv_ipv6_ext_headers {
+    uint8_t has_ext_headers;     /* 1 if extension headers are present */
+    uint8_t ext_header_count;    /* Number of extension headers */
+    uint16_t total_ext_length;   /* Total length of all extension headers */
+    uint8_t final_protocol;      /* Final protocol after all extension headers */
+    
+    /* Fragment header information (if present) */
+    uint32_t fragment_id;        /* Fragment identification */
+    uint16_t fragment_offset;    /* Fragment offset (in 8-byte units) */
+    uint8_t fragment_flags;      /* Fragment flags (more fragments bit) */
+    
+    uint8_t reserved;            /* Padding for alignment */
+} pcv_ipv6_ext_headers;
+
 /* Legacy IPv4-only flow key for backward compatibility */
 typedef struct pcv_flow_key {
     uint32_t src_ip;
@@ -118,6 +133,9 @@ uint32_t pcv_flow_hash_key(const pcv_flow_key* key);
 /* Flow key extraction - Enhanced IPv4/IPv6 API */
 int pcv_flow_extract_key_v6(const pcv_packet* packet, pcv_flow_key_v6* key);
 uint32_t pcv_flow_hash_key_v6(const pcv_flow_key_v6* key);
+
+/* IPv6 extension header parsing */
+int pcv_parse_ipv6_ext_headers(const pcv_packet* packet, pcv_ipv6_ext_headers* ext_info);
 
 /* Key conversion utilities */
 int pcv_flow_key_v4_to_v6(const pcv_flow_key* v4_key, pcv_flow_key_v6* v6_key);
