@@ -165,14 +165,6 @@ sudo ./pcv.sh en0 "(= ip-version 6)" 100           # Capture 100 IPv6 packets
 sudo ./pcv.sh en0 "(= dst-port 443)" t:60          # Capture HTTPS for 60 seconds
 ```
 
-## Next Steps
-
-### Phase 5: Production Hardening
-- Signal handling improvements
-- Thread-safe operations
-- Performance optimizations
-- Documentation
-
 ## Architecture
 
 ```
