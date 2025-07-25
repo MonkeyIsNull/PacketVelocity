@@ -230,8 +230,6 @@ PacketVelocity now includes comprehensive IPv6 support through VelocityFilterMac
 - **High performance**: ARM64 JIT compilation for IPv6 operations
 - **Safety verified**: Enhanced verifier prevents IPv6-related crashes
 
-See `VelocityFilterMachine/IPv6_IMPLEMENTATION_SUMMARY.md` for complete details.
-
 ## License
 
 MIT
