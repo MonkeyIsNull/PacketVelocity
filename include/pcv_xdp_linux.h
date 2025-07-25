@@ -6,6 +6,47 @@
 #include <sys/types.h>
 #include "pcv_platform.h"
 
+#ifdef __linux__
+/* Try to include XDP headers, fall back to stub definitions if not available */
+#ifdef __has_include
+#if __has_include(<linux/if_xdp.h>) && __has_include(<bpf/xsk.h>)
+#include <linux/if_xdp.h>
+#include <bpf/xsk.h>
+#define PCV_HAS_XDP 1
+#else
+#define PCV_HAS_XDP 0
+#endif
+#else
+/* Older compilers - try to include and handle errors at compile time */
+#include <linux/if_xdp.h>
+#include <bpf/xsk.h>
+#define PCV_HAS_XDP 1
+#endif
+#else
+#define PCV_HAS_XDP 0
+#endif
+
+#if !PCV_HAS_XDP
+/* Stub definitions for when XDP is not available */
+struct xsk_ring_prod {
+    uint32_t cached_prod;
+    uint32_t cached_cons;
+    uint32_t mask;
+    uint32_t size;
+    void *producer;
+    void *addr;
+};
+
+struct xsk_ring_cons {
+    uint32_t cached_prod;
+    uint32_t cached_cons;
+    uint32_t mask;
+    uint32_t size;
+    void *consumer;
+    void *addr;
+};
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

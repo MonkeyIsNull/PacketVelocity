@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <inttypes.h>
 #include <signal.h>
 #include <unistd.h>
 #include <getopt.h>
@@ -479,24 +481,24 @@ int main(int argc, char* argv[]) {
     pcv_stats* stats = pcv_get_stats(g_handle);
     if (stats) {
         printf("\nCapture Statistics:\n");
-        printf("  Interface received: %llu (total packets seen by network interface)\n", stats->packets_received);
-        printf("  Interface dropped:  %llu (packets lost due to buffer overruns)\n", stats->packets_dropped);
-        printf("  Application output: %llu (packets displayed to user)\n", g_packet_count);
+        printf("  Interface received: %" PRIu64 " (total packets seen by network interface)\n", stats->packets_received);
+        printf("  Interface dropped:  %" PRIu64 " (packets lost due to buffer overruns)\n", stats->packets_dropped);
+        printf("  Application output: %" PRIu64 " (packets displayed to user)\n", g_packet_count);
         
         if (ctx.filter) {
             uint64_t processed, accepted, dropped;
             pcv_filter_get_stats(ctx.filter, &processed, &accepted, &dropped);
             
             printf("\nFilter Statistics:\n");
-            printf("  Total processed: %llu\n", processed);
+            printf("  Total processed: %" PRIu64 "\n", processed);
             if (processed > 0) {
                 double accept_pct = (double)accepted / processed * 100.0;
                 double reject_pct = (double)dropped / processed * 100.0;
-                printf("  Matched criteria: %llu (%.1f%%)\n", accepted, accept_pct);
-                printf("  Rejected by filter: %llu (%.1f%%)\n", dropped, reject_pct);
+                printf("  Matched criteria: %" PRIu64 " (%.1f%%)\n", accepted, accept_pct);
+                printf("  Rejected by filter: %" PRIu64 " (%.1f%%)\n", dropped, reject_pct);
             } else {
-                printf("  Matched criteria: %llu\n", accepted);
-                printf("  Rejected by filter: %llu\n", dropped);
+                printf("  Matched criteria: %" PRIu64 "\n", accepted);
+                printf("  Rejected by filter: %" PRIu64 "\n", dropped);
             }
         }
     }

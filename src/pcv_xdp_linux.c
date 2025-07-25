@@ -7,10 +7,13 @@
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
-#include <linux/if_link.h>
-#include <linux/if_xdp.h>
 #include <net/if.h>
 #include <ifaddrs.h>
+
+#if PCV_HAS_XDP
+#include <linux/if_link.h>
+#include <linux/if_xdp.h>
+#endif
 
 /* Note: This implementation requires libxdp and libbpf
  * On Ubuntu/Debian: apt install libxdp-dev libbpf-dev
