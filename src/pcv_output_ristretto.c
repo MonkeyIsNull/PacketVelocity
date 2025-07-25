@@ -239,7 +239,7 @@ pcv_output* pcv_output_create(pcv_output_type type, const char* target) {
     printf("Flow table capacity: %u flows, %u buckets\n", 
            ctx->flow_config.max_flows, ctx->flow_config.hash_buckets);
     printf("Flush configuration: batch_size=%u, interval=%" PRIu64 " ms\n",
-           ctx->batch_size, ctx->flush_interval_ns / 1000000ULL);
+           ctx->batch_size, (uint64_t)(ctx->flush_interval_ns / 1000000ULL));
     
     return output;
 }

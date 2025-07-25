@@ -1,7 +1,46 @@
-#include "ristretto.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <inttypes.h>
+
+#if HAVE_RISTRETTO
+#include "ristretto.h"
+#else
+/* Stub definitions when RistrettoDB is not available */
+typedef struct RistrettoTable RistrettoTable;
+
+typedef enum {
+    RISTRETTO_COL_INTEGER,
+    RISTRETTO_COL_REAL,
+    RISTRETTO_COL_TEXT,
+    RISTRETTO_COL_NULLABLE
+} RistrettoColumnType;
+
+typedef struct {
+    union {
+        int64_t integer;
+        double real;
+        struct {
+            const char *data;
+            size_t length;
+        } text;
+    } value;
+    RistrettoColumnType type;
+    bool is_null;
+} RistrettoValue;
+
+typedef struct {
+    const char *name;
+    RistrettoColumnType type;
+    size_t size;
+    size_t offset;
+} RistrettoColumnDesc;
+
+#define RISTRETTO_VERSION "stub-1.0.0"
+#define RISTRETTO_VERSION_NUMBER 100
+#endif
 
 /* Internal structure for stub RistrettoTable */
 struct RistrettoTable {
@@ -69,7 +108,7 @@ bool ristretto_table_append_row(RistrettoTable *table, const RistrettoValue *val
     table->row_count++;
     
     if (table->row_count % 100 == 0) {
-        printf("RistrettoDB stub: Appended %llu rows to table '%s'\n", 
+        printf("RistrettoDB stub: Appended %" PRIu64 " rows to table '%s'\n", 
                table->row_count, table->name);
     }
     
