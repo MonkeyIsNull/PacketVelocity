@@ -23,6 +23,9 @@ LINUX_LDFLAGS = -lxdp -lbpf
 # Platform detection
 UNAME_S := $(shell uname -s)
 
+# RistrettoDB support (optional)
+HAVE_RISTRETTO ?= 0
+
 # Build mode configuration
 ifeq ($(BUILD_MODE),development)
     # Development: Use local source libraries with latest changes
@@ -31,7 +34,19 @@ ifeq ($(BUILD_MODE),development)
     
     VFM_INCLUDES = -I$(VFM_ROOT)/include -I$(VFM_ROOT)/dsl/vflisp
     VFM_LDFLAGS = $(VFM_ROOT)/libvfm.a
-    RISTRETTO_LDFLAGS = $(RISTRETTO_ROOT)/lib/libristretto.a
+    
+    # Check if RistrettoDB is available in development mode
+    ifeq ($(HAVE_RISTRETTO),1)
+        RISTRETTO_LDFLAGS = $(RISTRETTO_ROOT)/lib/libristretto.a
+        CFLAGS += -DHAVE_RISTRETTO=1
+    else ifneq ($(wildcard $(RISTRETTO_ROOT)/lib/libristretto.a),)
+        RISTRETTO_LDFLAGS = $(RISTRETTO_ROOT)/lib/libristretto.a
+        CFLAGS += -DHAVE_RISTRETTO=1
+        HAVE_RISTRETTO = 1
+    else
+        RISTRETTO_LDFLAGS = 
+        CFLAGS += -DHAVE_RISTRETTO=0
+    endif
     
     # Include VFLisp sources directly in development mode
     VFLISP_SOURCES = $(VFM_ROOT)/dsl/vflisp/vflisp_parser.c \
@@ -40,7 +55,15 @@ else ifeq ($(BUILD_MODE),production)
     # Production: Use installed system libraries
     VFM_INCLUDES = -I$(PREFIX)/include
     VFM_LDFLAGS = -L$(PREFIX)/lib -lvfm
-    RISTRETTO_LDFLAGS = -L$(PREFIX)/lib -lristretto
+    
+    # Check if RistrettoDB is available in production mode
+    ifeq ($(HAVE_RISTRETTO),1)
+        RISTRETTO_LDFLAGS = -L$(PREFIX)/lib -lristretto
+        CFLAGS += -DHAVE_RISTRETTO=1
+    else
+        RISTRETTO_LDFLAGS = 
+        CFLAGS += -DHAVE_RISTRETTO=0
+    endif
     
     # No VFLisp sources - use installed library
     VFLISP_SOURCES = 
@@ -98,7 +121,7 @@ build-info:
 ifeq ($(BUILD_MODE),development)
 	@echo "  Using local sources (development mode)"
 	@echo "  VFM Root: $(VFM_ROOT)"
-	@echo "  RistrettoDB Root: $(RISTRETTO_ROOT)"
+	@echo "  RistrettoDB Support: $(HAVE_RISTRETTO)"
 else
 	@echo "  Using installed libraries (production mode)"
 endif
@@ -212,6 +235,7 @@ help:
 	@echo "Variables:"
 	@echo "  PREFIX=$(PREFIX)        - Installation prefix"
 	@echo "  BUILD_MODE=$(BUILD_MODE) - Current build mode"
+	@echo "  HAVE_RISTRETTO=$(HAVE_RISTRETTO) - RistrettoDB support (0=disabled, 1=enabled)"
 
 # Dependencies
 src/pcv_main.o: include/pcv.h include/pcv_platform.h

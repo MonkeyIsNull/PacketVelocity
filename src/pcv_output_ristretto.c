@@ -1,11 +1,14 @@
 #include "pcv_output.h"
 #include "pcv_flow.h"
-#include "ristretto.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <arpa/inet.h>
+
+#if HAVE_RISTRETTO
+#include "ristretto.h"
+#endif
 
 /* RistrettoDB output stub implementation
  * This is a placeholder for actual RistrettoDB integration
@@ -15,7 +18,11 @@
 
 typedef struct pcv_ristretto_context {
     char* database_file;
+#if HAVE_RISTRETTO
     RistrettoDB* db;
+#else
+    void* db;  /* Placeholder when RistrettoDB is not available */
+#endif
     
     /* Flow aggregation */
     pcv_flow_table* flow_table;
@@ -40,6 +47,7 @@ typedef struct pcv_ristretto_context {
 
 /* Initialize RistrettoDB database and table */
 static int init_ristretto_database(pcv_ristretto_context* ctx) {
+#if HAVE_RISTRETTO
     const char* schema_sql = 
         "CREATE TABLE IF NOT EXISTS packet_flows ("
         "flow_id INTEGER PRIMARY KEY, "
@@ -75,6 +83,11 @@ static int init_ristretto_database(pcv_ristretto_context* ctx) {
     
     printf("RistrettoDB database initialized successfully: %s\n", ctx->database_file);
     return 0;
+#else
+    printf("RistrettoDB support not compiled in - using stub implementation\n");
+    ctx->db = NULL;
+    return 0;
+#endif
 }
 
 /* Convert IP address to string */
@@ -97,8 +110,8 @@ static int insert_flow_to_database(pcv_ristretto_context* ctx, const pcv_flow_st
         "flow_id, src_ip, dst_ip, src_port, dst_port, protocol, "
         "first_seen, last_seen, duration_ms, packet_count, byte_count, tcp_flags, flow_state"
         ") VALUES ("
-        "%lu, '%s', '%s', %u, %u, %u, "
-        "%lu, %lu, %lu, %lu, %lu, %u, %u"
+        "%u, '%s', '%s', %u, %u, %u, "
+        "%llu, %llu, %llu, %llu, %llu, %u, %u"
         ")",
         flow->flow_id, src_ip_str, dst_ip_str,
         flow->key.src_port, flow->key.dst_port, flow->key.protocol,
@@ -110,6 +123,7 @@ static int insert_flow_to_database(pcv_ristretto_context* ctx, const pcv_flow_st
     );
     
     /* Execute the insert */
+#if HAVE_RISTRETTO
     RistrettoResult result = ristretto_exec(ctx->db, sql_buffer);
     if (result == RISTRETTO_OK) {
         ctx->total_inserts++;
@@ -120,6 +134,16 @@ static int insert_flow_to_database(pcv_ristretto_context* ctx, const pcv_flow_st
         fprintf(stderr, "Failed to insert flow: %s\n", ristretto_error_string(result));
         return -1;
     }
+#else
+    /* Stub implementation - just log to file if available */
+    if (ctx->log_file) {
+        fprintf(ctx->log_file, "%s\n", sql_buffer);
+        fflush(ctx->log_file);
+    }
+    ctx->total_inserts++;
+    ctx->current_batch_count++;
+    return 0;
+#endif
 }
 
 /* Bulk insert callback for flow iteration */
@@ -181,7 +205,11 @@ pcv_output* pcv_output_create(pcv_output_type type, const char* target) {
     /* Create flow table */
     ctx->flow_table = pcv_flow_table_create(&ctx->flow_config);
     if (!ctx->flow_table) {
-        ristretto_close(ctx->db);
+#if HAVE_RISTRETTO
+        if (ctx->db) {
+            ristretto_close(ctx->db);
+        }
+#endif
         free(ctx->database_file);
         free(ctx);
         free(output);
@@ -225,7 +253,9 @@ void pcv_output_destroy(pcv_output* output) {
         
         /* Close RistrettoDB database */
         if (ctx->db) {
+#if HAVE_RISTRETTO
             ristretto_close(ctx->db);
+#endif
         }
         
         /* Destroy flow table */
