@@ -28,31 +28,32 @@ MACOS_LDFLAGS =
 LINUX_CFLAGS = -DPLATFORM_LINUX
 LINUX_LDFLAGS =
 
-# RistrettoDB support (optional)
-HAVE_RISTRETTO ?= 0
+# RistrettoDB output backend (OPTIONAL, opt-in, default OFF).
+#
+# The DEFAULT build is hermetic: it has ZERO RistrettoDB dependency and streams
+# captured packets to stdout like tcpdump.
+#
+# Enable the optional RistrettoDB output backend explicitly with:
+#     make RISTRETTO=1
+# Point at a RistrettoDB checkout other than ../RistrettoDB with:
+#     make RISTRETTO=1 RISTRETTO_ROOT=/path/to/RistrettoDB
+#
+# NOTE: the RistrettoDB output layer (src/pcv_output_ristretto.c) currently
+# targets RistrettoDB's deprecated SQL API and still needs to be migrated to the
+# V2 append-only table API. Until that migration lands, a `RISTRETTO=1` build may
+# not compile/link against the newest RistrettoDB. See the TODO at the top of
+# src/pcv_output_ristretto.c.
+RISTRETTO ?= 0
+RISTRETTO_ROOT ?= ../RistrettoDB
 
-# Build mode configuration
+# Build mode configuration (controls how VelocityFilterMachine is found)
 ifeq ($(BUILD_MODE),development)
     # Development: Use local source libraries with latest changes
     VFM_ROOT = ../VelocityFilterMachine
-    RISTRETTO_ROOT = ../RistrettoDB
-    
+
     VFM_INCLUDES = -I$(VFM_ROOT)/include -I$(VFM_ROOT)/dsl/vflisp
     VFM_LDFLAGS = $(VFM_ROOT)/libvfm.a
-    
-    # Check if RistrettoDB is available in development mode
-    ifeq ($(HAVE_RISTRETTO),1)
-        RISTRETTO_LDFLAGS = $(RISTRETTO_ROOT)/lib/libristretto.a
-        CFLAGS += -DHAVE_RISTRETTO=1
-    else ifneq ($(wildcard $(RISTRETTO_ROOT)/lib/libristretto.a),)
-        RISTRETTO_LDFLAGS = $(RISTRETTO_ROOT)/lib/libristretto.a
-        CFLAGS += -DHAVE_RISTRETTO=1
-        HAVE_RISTRETTO = 1
-    else
-        RISTRETTO_LDFLAGS = 
-        CFLAGS += -DHAVE_RISTRETTO=0
-    endif
-    
+
     # Include VFLisp sources directly in development mode
     VFLISP_SOURCES = $(VFM_ROOT)/dsl/vflisp/vflisp_parser.c \
                      $(VFM_ROOT)/dsl/vflisp/vflisp_compile.c
@@ -60,39 +61,47 @@ else ifeq ($(BUILD_MODE),production)
     # Production: Use installed system libraries
     VFM_INCLUDES = -I$(PREFIX)/include
     VFM_LDFLAGS = -L$(PREFIX)/lib -lvfm
-    
-    # Check if RistrettoDB is available in production mode
-    ifeq ($(HAVE_RISTRETTO),1)
-        RISTRETTO_LDFLAGS = -L$(PREFIX)/lib -lristretto
-        CFLAGS += -DHAVE_RISTRETTO=1
-    else
-        RISTRETTO_LDFLAGS = 
-        CFLAGS += -DHAVE_RISTRETTO=0
-    endif
-    
+
     # No VFLisp sources - use installed library
-    VFLISP_SOURCES = 
+    VFLISP_SOURCES =
 else
     $(error Invalid BUILD_MODE: $(BUILD_MODE). Use 'development' or 'production')
+endif
+
+# Optional RistrettoDB output backend (opt-in via RISTRETTO=1).
+# Default: nothing to include, link, or compile -> zero dependency.
+RISTRETTO_INCLUDES =
+RISTRETTO_LDFLAGS =
+RISTRETTO_SOURCES =
+ifeq ($(RISTRETTO),1)
+    CFLAGS += -DHAVE_RISTRETTO=1
+    RISTRETTO_INCLUDES = -I$(RISTRETTO_ROOT)/embed
+    RISTRETTO_SOURCES = src/pcv_output_ristretto.c src/ristretto_stub.c
+    ifeq ($(BUILD_MODE),production)
+        RISTRETTO_LDFLAGS = -L$(PREFIX)/lib -lristretto
+    else
+        RISTRETTO_LDFLAGS = $(RISTRETTO_ROOT)/lib/libristretto.a
+    endif
 endif
 
 # Base includes
 BASE_INCLUDES = -I./include
 
 # Combined includes
-INCLUDES = $(BASE_INCLUDES) $(VFM_INCLUDES)
+INCLUDES = $(BASE_INCLUDES) $(VFM_INCLUDES) $(RISTRETTO_INCLUDES)
 
 # Combined LDFLAGS
 LDFLAGS = $(VFM_LDFLAGS) $(RISTRETTO_LDFLAGS)
 
-# Core source files
+# Core source files (terminal/stdout capture pipeline - no external output deps)
 CORE_SOURCES = src/pcv_main.c \
                src/pcv_platform.c \
                src/pcv_filter_vfm.c \
-               src/pcv_output_ristretto.c \
                src/pcv_ringbuf.c \
-               src/pcv_flow.c \
-               src/ristretto_stub.c
+               src/pcv_flow.c
+
+# Optional RistrettoDB output backend sources (only when RISTRETTO=1)
+CORE_SOURCES += $(RISTRETTO_SOURCES)
 
 # All sources (core + VFLisp if in development mode)
 SOURCES = $(CORE_SOURCES) $(VFLISP_SOURCES)
@@ -112,7 +121,7 @@ OBJECTS = $(SOURCES:.c=.o)
 TARGET = packetvelocity
 
 # Targets
-.PHONY: all clean debug test bench install uninstall install-deps help
+.PHONY: all build-info clean debug test examples install uninstall install-deps help
 .PHONY: dev prod pcv-macos pcv-linux
 
 all: build-info $(TARGET)
@@ -126,9 +135,12 @@ build-info:
 ifeq ($(BUILD_MODE),development)
 	@echo "  Using local sources (development mode)"
 	@echo "  VFM Root: $(VFM_ROOT)"
-	@echo "  RistrettoDB Support: $(HAVE_RISTRETTO)"
 else
 	@echo "  Using installed libraries (production mode)"
+endif
+	@echo "  RistrettoDB output backend (opt-in): $(RISTRETTO)"
+ifeq ($(RISTRETTO),1)
+	@echo "  RistrettoDB Root: $(RISTRETTO_ROOT)"
 endif
 
 # Convenience targets
@@ -182,37 +194,79 @@ uninstall:
 	rm -f $(PREFIX)/bin/$(TARGET)
 	@echo "PacketVelocity uninstalled"
 
-# Install dependencies (VFM and RistrettoDB)
+# Install the required dependency (VelocityFilterMachine).
+# RistrettoDB is an OPTIONAL, opt-in output backend and is NOT installed here;
+# build it separately and enable it with `make RISTRETTO=1` if you want it.
 install-deps:
-	@echo "Installing dependencies..."
-	@echo "Installing VelocityFilterMachine..."
+	@echo "Installing required dependency (VelocityFilterMachine)..."
 	$(MAKE) -C ../VelocityFilterMachine install PREFIX=$(PREFIX)
-	@echo "Installing RistrettoDB..."
-	$(MAKE) -C ../RistrettoDB install PREFIX=$(PREFIX)
-	@echo "All dependencies installed to $(PREFIX)"
+	@echo "VelocityFilterMachine installed to $(PREFIX)"
+	@echo "NOTE: RistrettoDB is optional; enable the output backend with 'make RISTRETTO=1'"
 
 # Clean
 clean:
 	rm -f $(OBJECTS) $(TARGET)
 	rm -f tests/*.o benchmarks/*.o
+	rm -f tests/test_ringbuf tests/test_flow tests/test_replay
+	rm -f examples/simple_capture
 	@echo "Cleaned build artifacts"
 
-# Test
-TEST_VFM_OBJECTS = $(filter-out src/pcv_main.o, $(OBJECTS))
+# ---- Offline tests -------------------------------------------------------
+# All tests run WITHOUT root and WITHOUT live packet capture. The capture
+# pipeline is exercised with synthetic packets and an in-process pcap replay
+# harness (tests/pcap_replay.c), so capture/filter logic is testable in CI.
+#
+# Tests always build in the DEFAULT configuration (no RistrettoDB dependency).
+TEST_DIR = tests
 
-test_vfm: test_vfm.c $(TEST_VFM_OBJECTS)
-	$(CC) $(VFM_CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+ifeq ($(UNAME_S),Darwin)
+    TEST_PLATFORM_CFLAGS = $(MACOS_CFLAGS)
+else
+    TEST_PLATFORM_CFLAGS = $(LINUX_CFLAGS)
+endif
 
 test:
-	@echo "Running tests..."
-	$(CC) $(CFLAGS) $(INCLUDES) tests/test_bpf.c -o tests/test_bpf
-	./tests/test_bpf
+	@echo "Building offline tests (no root, no live capture)..."
+	$(CC) $(CFLAGS) $(BASE_INCLUDES) \
+	    $(TEST_DIR)/test_ringbuf.c src/pcv_ringbuf.c \
+	    -o $(TEST_DIR)/test_ringbuf
+	$(CC) $(CFLAGS) $(BASE_INCLUDES) \
+	    $(TEST_DIR)/test_flow.c src/pcv_flow.c \
+	    -o $(TEST_DIR)/test_flow
+	$(CC) $(VFM_CFLAGS) $(TEST_PLATFORM_CFLAGS) $(BASE_INCLUDES) $(VFM_INCLUDES) \
+	    $(TEST_DIR)/test_replay.c $(TEST_DIR)/pcap_replay.c \
+	    src/pcv_filter_vfm.c src/pcv_flow.c $(VFLISP_SOURCES) \
+	    -o $(TEST_DIR)/test_replay $(VFM_LDFLAGS)
+	@echo ""
+	@echo "=== test_ringbuf ==="
+	@./$(TEST_DIR)/test_ringbuf
+	@echo ""
+	@echo "=== test_flow ==="
+	@./$(TEST_DIR)/test_flow
+	@echo ""
+	@echo "=== test_replay (pcap replay -> filter -> flow pipeline) ==="
+	@./$(TEST_DIR)/test_replay
+	@echo ""
+	@echo "All tests passed."
 
-# Benchmarks
-bench:
-	@echo "Running benchmarks..."
-	$(CC) $(CFLAGS) $(INCLUDES) benchmarks/bench_capture.c -o benchmarks/bench_capture
-	./benchmarks/bench_capture
+# ---- Example programs ----------------------------------------------------
+# NOTE: the Makefile builds the `packetvelocity` CLI binary, not a
+# libpacketvelocity archive, so examples are compiled directly against the
+# capture sources (plus VelocityFilterMachine).
+EXAMPLE_LIB_SOURCES = src/pcv_platform.c src/pcv_filter_vfm.c \
+                      src/pcv_ringbuf.c src/pcv_flow.c $(VFLISP_SOURCES)
+ifeq ($(UNAME_S),Darwin)
+    EXAMPLE_LIB_SOURCES += src/pcv_bpf_macos.c
+else ifeq ($(UNAME_S),Linux)
+    EXAMPLE_LIB_SOURCES += src/pcv_raw_linux.c
+endif
+
+examples: examples/simple_capture
+	@echo "Built examples (run live capture with root, e.g. sudo ./examples/simple_capture en0)"
+
+examples/simple_capture: examples/simple_capture.c $(EXAMPLE_LIB_SOURCES)
+	$(CC) $(VFM_CFLAGS) $(TEST_PLATFORM_CFLAGS) $(BASE_INCLUDES) $(VFM_INCLUDES) \
+	    $< $(EXAMPLE_LIB_SOURCES) -o $@ $(VFM_LDFLAGS)
 
 # Help
 help:
@@ -226,21 +280,27 @@ help:
 	@echo "  make BUILD_MODE=development - Explicit development build"
 	@echo "  make BUILD_MODE=production  - Explicit production build"
 	@echo ""
+	@echo ""
+	@echo "Optional RistrettoDB output backend (opt-in, default OFF):"
+	@echo "  make RISTRETTO=1        - Build with the RistrettoDB output backend"
+	@echo "  make RISTRETTO=1 RISTRETTO_ROOT=/path - Use a specific RistrettoDB checkout"
+	@echo "  (NOTE: the output layer still targets the deprecated SQL API and may"
+	@echo "   not link against the newest RistrettoDB until the V2 migration.)"
+	@echo ""
 	@echo "Other targets:"
 	@echo "  make debug              - Build with debug symbols"
 	@echo "  make clean              - Remove build artifacts"
-	@echo "  make test               - Run tests"
-	@echo "  make bench              - Run benchmarks"
+	@echo "  make test               - Build and run the offline tests (no root)"
 	@echo ""
 	@echo "Installation:"
-	@echo "  make install-deps       - Install VFM and RistrettoDB dependencies"
+	@echo "  make install-deps       - Install the required dependency (VFM)"
 	@echo "  make install            - Install PacketVelocity to $(PREFIX)"
 	@echo "  make uninstall          - Remove PacketVelocity from $(PREFIX)"
 	@echo ""
 	@echo "Variables:"
 	@echo "  PREFIX=$(PREFIX)        - Installation prefix"
-	@echo "  BUILD_MODE=$(BUILD_MODE) - Current build mode"
-	@echo "  HAVE_RISTRETTO=$(HAVE_RISTRETTO) - RistrettoDB support (0=disabled, 1=enabled)"
+	@echo "  BUILD_MODE=$(BUILD_MODE) - Current build mode (development/production)"
+	@echo "  RISTRETTO=$(RISTRETTO)  - Optional RistrettoDB backend (0=off, 1=on)"
 
 # Dependencies
 src/pcv_main.o: include/pcv.h include/pcv_platform.h

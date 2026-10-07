@@ -6,22 +6,28 @@ High-performance packet capture library with platform-specific optimizations.
 
 ## Status
 Please note, this is still a work in progress and very alpha.
-I have gotten it to run and log packets to stdout but beyond that you may be in for a wild and broken ride.
+The default build runs like tcpdump: it captures and logs packets to stdout with
+**zero external output dependencies**. Everything beyond that is still rough.
 
-- Actual Linux support is untested at this time.
+- **macOS (BPF) is the primary, actively-exercised platform.**
+- **Linux (raw sockets / AF_PACKET) is implemented but untested** - treat it as experimental.
+- **Live capture requires root** (`sudo`) on both platforms, since it opens
+  `/dev/bpf*` (macOS) or raw sockets (Linux).
+- The RistrettoDB output backend is **optional and opt-in** (`make RISTRETTO=1`);
+  it is NOT built by default and is not required to capture.
 
 
 ### What's Implemented
 
 **Core Components:**
 - Platform abstraction layer (pcv_platform.h)
-- macOS BPF backend with mmap() support
-- Linux AF_XDP backend with zero-copy support
+- macOS BPF backend with mmap() support (primary, actively used)
+- Linux raw socket backend (AF_PACKET, promiscuous mode) - untested
 - Ring buffer for batch processing
 - VFM (VelocityFilterMachine) with full IPv6 support
 - VFLisp DSL for intuitive filter programming
-- CLI tool with filter support
-- RistrettoDB output stub
+- CLI tool that streams captured packets to stdout, tcpdump-style
+- Optional RistrettoDB output backend (opt-in, OFF by default; see below)
 
 **IPv6 Support (NEW):**
 - Complete IPv6 field access (src-ip6, dst-ip6)
@@ -57,7 +63,7 @@ I have gotten it to run and log packets to stdout but beyond that you may be in 
 ## Building
 
 ```bash
-# Build from source
+# Default build - hermetic, no RistrettoDB dependency, streams to stdout
 make clean
 make
 
@@ -65,14 +71,42 @@ make
 make pcv-macos    # macOS only
 make pcv-linux    # Linux only
 
+# Run the offline test suite (no root, no live capture)
+make test
+
+# Build the bundled example program(s)
+make examples
+
 # Install system-wide (optional)
 sudo make install  # Installs to /usr/local/bin
 ```
 
+### Optional RistrettoDB output backend (opt-in)
+
+RistrettoDB output is **off by default**. The default build has zero RistrettoDB
+dependency. To build with it, enable it explicitly and point at a RistrettoDB
+checkout:
+
+```bash
+make RISTRETTO=1                              # expects ../RistrettoDB
+make RISTRETTO=1 RISTRETTO_ROOT=/path/to/RistrettoDB
+```
+
+> **Note:** the RistrettoDB output layer still targets RistrettoDB's deprecated
+> SQL API and has not yet been migrated to the V2 append-only table API, so a
+> `RISTRETTO=1` build may not compile/link against the newest RistrettoDB until
+> that migration lands. This is tracked as a follow-up task.
+
 ## Dependencies
 
-**macOS:** No external dependencies
-**Linux:** No external dependencies (uses standard raw sockets)
+**Build (all platforms):** [VelocityFilterMachine](https://github.com/MonkeyIsNull/VelocityFilterMachine)
+is required (provides `libvfm.a` and the VFLisp compiler). It is expected at
+`../VelocityFilterMachine` for the default development build.
+
+**Runtime:**
+- **macOS:** no external runtime dependencies (uses BSD/Darwin BPF). Root required for live capture.
+- **Linux:** no external runtime dependencies (uses standard raw sockets). Root required for live capture.
+- **RistrettoDB:** optional, opt-in only (see above).
 
 ## Usage
 
@@ -128,19 +162,26 @@ sudo ./packetvelocity -i en0 -f myfilter.bin
 
 ## Performance Targets
 
+These are **design goals**, not benchmarked results on this alpha codebase.
+
 | Platform | Target | Packet Size | Status |
 |----------|--------|-------------|---------|
-| macOS BPF | 500K-1M pps | 64 byte | Implemented |
-| Linux Raw Sockets | 100K-500K pps | 64 byte | Implemented |
+| macOS BPF | 500K-1M pps | 64 byte | Backend implemented (not benchmarked) |
+| Linux Raw Sockets | 100K-500K pps | 64 byte | Backend implemented, untested |
 
 ## Examples
 
-```bash
-# Simple capture example
-gcc examples/simple_capture.c -I./include -L. -lpacketvelocity -o simple_capture
+The Makefile builds the `packetvelocity` CLI binary (not a `libpacketvelocity`
+archive), so the bundled example is compiled directly against the capture
+sources via the `examples` target:
 
-# Linux NUMA demo (Linux only)
-gcc examples/linux_numa_demo.c -I./include -L. -lpacketvelocity -o numa_demo
+```bash
+# Build the example program(s)
+make examples
+
+# Run it (live capture needs root)
+sudo ./examples/simple_capture en0    # macOS
+sudo ./examples/simple_capture eth0   # Linux
 ```
 
 ### pcv.sh Script Usage
@@ -165,7 +206,7 @@ PacketVelocity
 │   └── Linux: Raw sockets + VFM filtering (implemented)
 ├── Ring Buffer Manager (implemented)
 ├── Filter Engine (VFM with IPv6 support)
-└── Output Plugins (RistrettoDB stub)
+└── Output: stdout stream (default) + optional RistrettoDB backend (opt-in)
 ```
 
 ## API Design
@@ -174,7 +215,7 @@ PacketVelocity
 // Initialize capture
 pcv_handle* pcv_open(const char* interface, pcv_config* config);
 
-// Set filter (TinyTotVM bytecode or BPF)
+// Set filter (VFM bytecode or BPF)
 int pcv_set_filter(pcv_handle* h, void* filter, size_t len);
 
 // Capture packets
@@ -197,8 +238,8 @@ pcv_stats* pcv_get_stats(pcv_handle* h);
 
 ## Core Dependencies
 
-- **VFM**: [VelocityFilterMachine](https://github.com/MonkeyIsNull/VelocityFilterMachine) with complete IPv6 support and JIT compilation
-- **RistrettoDB**: https://github.com/MonkeyIsNull/RistrettoDB (optional - stubbed if not available)
+- **VFM** (required): [VelocityFilterMachine](https://github.com/MonkeyIsNull/VelocityFilterMachine) with complete IPv6 support and JIT compilation
+- **RistrettoDB** (optional, opt-in): https://github.com/MonkeyIsNull/RistrettoDB - only compiled in with `make RISTRETTO=1`; the default build has no RistrettoDB dependency
 
 **Platform Dependencies:**
 - macOS: No external dependencies (uses BSD/Darwin BPF)

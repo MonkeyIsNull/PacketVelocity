@@ -1,3 +1,20 @@
+/* =============================================================================
+ * PacketVelocity RistrettoDB stub shim (OPTIONAL, opt-in)
+ * -----------------------------------------------------------------------------
+ * Compiled ONLY when the tree is built with `make RISTRETTO=1`. The DEFAULT
+ * build does not compile this file.
+ *
+ * This file provides local stand-ins for the RistrettoDB V2 table API so the
+ * opt-in output backend can be developed without a RistrettoDB checkout.
+ *
+ * TODO (later task - RistrettoDB V2 migration):
+ *   Once src/pcv_output_ristretto.c is migrated to the real V2 append-only
+ *   table API and linked against a real libristretto, these stubs should be
+ *   dropped (they currently duplicate real library symbols when HAVE_RISTRETTO
+ *   is set, which is part of why a `RISTRETTO=1` link may fail until the
+ *   migration lands).
+ * =============================================================================
+ */
 #define _POSIX_C_SOURCE 200809L  /* For strdup */
 #include <stdio.h>
 #include <stdlib.h>

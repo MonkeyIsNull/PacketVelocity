@@ -1,3 +1,23 @@
+/* =============================================================================
+ * PacketVelocity RistrettoDB output backend (OPTIONAL, opt-in)
+ * -----------------------------------------------------------------------------
+ * This file is compiled ONLY when the tree is built with `make RISTRETTO=1`.
+ * The DEFAULT build is hermetic (terminal/stdout stream, like tcpdump) and does
+ * NOT compile or link this file or any RistrettoDB code.
+ *
+ * TODO (later task - RistrettoDB V2 migration):
+ *   This output layer still targets RistrettoDB's DEPRECATED SQL API
+ *   (ristretto_open / ristretto_exec / ristretto_close / RISTRETTO_OK, ...).
+ *   RistrettoDB has pivoted to a V2 append-only *table* API
+ *   (ristretto_table_create / ristretto_table_append_row / ristretto_value_* ,
+ *    see <RistrettoDB>/embed/ristretto.h). This code must be migrated to that
+ *   V2 API AND wired into the capture loop (pcv_main.c currently does not call
+ *   the output layer at all - it only streams to stdout).
+ *
+ *   Because of the deprecated API, a `RISTRETTO=1` build may NOT compile/link
+ *   against the newest RistrettoDB until that migration lands. This is expected.
+ * =============================================================================
+ */
 #define _POSIX_C_SOURCE 200809L  /* For strdup */
 #include "pcv_output.h"
 #include "pcv_flow.h"

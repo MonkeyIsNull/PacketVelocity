@@ -76,3 +76,9 @@ CLAUDE.md
 /ristretto
 /packetvelocity
 
+# Build outputs without file extensions (not caught by *.o / *.exe above)
+/examples/simple_capture
+/tests/test_ringbuf
+/tests/test_flow
+/tests/test_replay
+
