@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+# Note: CI never runs live packet capture (that needs root and a real NIC).
+# It builds the default (hermetic, no-RistrettoDB) binary and runs the offline
+# test suite, which replays synthetic packets through the capture pipeline.
+
+jobs:
+  build-and-test:
+    name: Build + offline tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - name: Checkout PacketVelocity
+        uses: actions/checkout@v4
+        with:
+          path: PacketVelocity
+
+      # VelocityFilterMachine is a required build dependency; PacketVelocity
+      # expects it at ../VelocityFilterMachine.
+      - name: Checkout VelocityFilterMachine
+        uses: actions/checkout@v4
+        with:
+          repository: MonkeyIsNull/VelocityFilterMachine
+          path: VelocityFilterMachine
+
+      - name: Build VelocityFilterMachine (libvfm.a)
+        working-directory: VelocityFilterMachine
+        run: make libvfm.a
+
+      - name: Build PacketVelocity (default, hermetic - no RistrettoDB)
+        working-directory: PacketVelocity
+        run: make
+
+      - name: Verify the default build pulls in no RistrettoDB code
+        working-directory: PacketVelocity
+        run: |
+          if nm packetvelocity | grep -i ristretto; then
+            echo "ERROR: default build references RistrettoDB symbols" >&2
+            exit 1
+          fi
+          echo "OK: default build is free of RistrettoDB symbols"
+
+      - name: Smoke-test the CLI (no capture)
+        working-directory: PacketVelocity
+        run: |
+          ./packetvelocity -V
+          ./packetvelocity --help
+
+      - name: Run offline test suite (no root, no live capture)
+        working-directory: PacketVelocity
+        run: make test
+
+      - name: Build bundled examples
+        working-directory: PacketVelocity
+        run: make examples
+
+  # Optional, opt-in RistrettoDB backend build. This is allowed to fail: the
+  # output layer still targets RistrettoDB's deprecated SQL API and has not yet
+  # been migrated to the V2 append-only table API, so it may not compile/link
+  # against the current RistrettoDB. Kept here to surface the status of the
+  # opt-in path without blocking the required default build.
+  ristretto-optional:
+    name: Build with RISTRETTO=1 (optional, allowed to fail)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout PacketVelocity
+        uses: actions/checkout@v4
+        with:
+          path: PacketVelocity
+
+      - name: Checkout VelocityFilterMachine
+        uses: actions/checkout@v4
+        with:
+          repository: MonkeyIsNull/VelocityFilterMachine
+          path: VelocityFilterMachine
+
+      - name: Checkout RistrettoDB
+        uses: actions/checkout@v4
+        with:
+          repository: MonkeyIsNull/RistrettoDB
+          path: RistrettoDB
+
+      - name: Build VelocityFilterMachine (libvfm.a)
+        working-directory: VelocityFilterMachine
+        run: make libvfm.a
+
+      - name: Build RistrettoDB (static lib)
+        working-directory: RistrettoDB
+        run: make static
+
+      - name: Build PacketVelocity with RISTRETTO=1 (may fail pre-migration)
+        working-directory: PacketVelocity
+        run: make RISTRETTO=1
