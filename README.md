@@ -92,10 +92,30 @@ make RISTRETTO=1                              # expects ../RistrettoDB
 make RISTRETTO=1 RISTRETTO_ROOT=/path/to/RistrettoDB
 ```
 
-> **Note:** the RistrettoDB output layer still targets RistrettoDB's deprecated
-> SQL API and has not yet been migrated to the V2 append-only table API, so a
-> `RISTRETTO=1` build may not compile/link against the newest RistrettoDB until
-> that migration lands. This is tracked as a follow-up task.
+The backend targets the RistrettoDB **V2** append-only, fixed-width table API
+and appends **one row per captured packet**. Route capture to a table with
+`--output ristretto:<path>` (writes `<path>.rdb`):
+
+```bash
+sudo ./packetvelocity -i en0 --output ristretto:/var/log/pv/capture
+# -> creates /var/log/pv/capture.rdb, one row per packet
+```
+
+The fixed schema (table `packets`) is IPv6-friendly: addresses are stored as
+text via `inet_ntop`, so full IPv6 / IPv4-mapped literals round-trip unchanged.
+
+| column | type | meaning |
+|--------|------|---------|
+| `ts_ns` | INTEGER | packet timestamp, nanoseconds since epoch |
+| `src_ip` / `dst_ip` | TEXT(46) | addresses (`inet_ntop`, AF_INET/AF_INET6) |
+| `src_port` / `dst_port` | INTEGER | L4 ports (host order; 0 if none) |
+| `protocol` | INTEGER | IP protocol number (6=TCP, 17=UDP, ...) |
+| `addr_family` | INTEGER | 4 (IPv4) or 6 (IPv6) |
+| `length` | INTEGER | original on-wire packet length |
+| `caplen` | INTEGER | captured length (`<= length`) |
+
+If you pass `--output ristretto:...` to a binary built **without** `RISTRETTO=1`,
+it fails fast with a clear message rather than silently ignoring the flag.
 
 ## Dependencies
 
@@ -158,6 +178,10 @@ sudo ./packetvelocity -i en0 -p -I
 
 # With pre-compiled VFM filter (bypasses JIT)
 sudo ./packetvelocity -i en0 -f myfilter.bin
+
+# Output sink: default is the tcpdump-style stdout stream ('-' / 'stdout').
+# With a RISTRETTO=1 build, append one row per packet to a RistrettoDB V2 table:
+sudo ./packetvelocity -i en0 -l "(= proto 6)" --output ristretto:/tmp/tcp_capture
 ```
 
 ## Performance Targets

@@ -63,15 +63,16 @@ jobs:
         working-directory: PacketVelocity
         run: make examples
 
-  # Optional, opt-in RistrettoDB backend build. This is allowed to fail: the
-  # output layer still targets RistrettoDB's deprecated SQL API and has not yet
-  # been migrated to the V2 append-only table API, so it may not compile/link
-  # against the current RistrettoDB. Kept here to surface the status of the
-  # opt-in path without blocking the required default build.
-  ristretto-optional:
-    name: Build with RISTRETTO=1 (optional, allowed to fail)
-    runs-on: ubuntu-latest
-    continue-on-error: true
+  # Opt-in RistrettoDB V2 backend: REQUIRED job. The output layer has been
+  # migrated to the RistrettoDB V2 append-only table API, so RISTRETTO=1 must
+  # build, link, and pass the offline sink round-trip test on both platforms.
+  ristretto-backend:
+    name: RISTRETTO=1 build + link + sink test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
     steps:
       - name: Checkout PacketVelocity
         uses: actions/checkout@v4
@@ -98,6 +99,19 @@ jobs:
         working-directory: RistrettoDB
         run: make static
 
-      - name: Build PacketVelocity with RISTRETTO=1 (may fail pre-migration)
+      - name: Build PacketVelocity with RISTRETTO=1 (build + link)
         working-directory: PacketVelocity
         run: make RISTRETTO=1
+
+      - name: Verify the RISTRETTO=1 build actually linked RistrettoDB
+        working-directory: PacketVelocity
+        run: |
+          if ! nm packetvelocity | grep -qi ristretto_table_create; then
+            echo "ERROR: RISTRETTO=1 build did not link RistrettoDB" >&2
+            exit 1
+          fi
+          echo "OK: RISTRETTO=1 build links the RistrettoDB V2 API"
+
+      - name: Run offline tests incl. the RistrettoDB V2 sink round-trip
+        working-directory: PacketVelocity
+        run: make RISTRETTO=1 test

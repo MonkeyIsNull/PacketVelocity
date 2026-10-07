@@ -55,10 +55,6 @@ int pcv_output_flush(pcv_output* output);
 void pcv_output_get_stats(const pcv_output* output, uint64_t* flows,
                           uint64_t* packets, uint64_t* bytes);
 
-/* RistrettoDB specific */
-int pcv_output_ristretto_init(const char* connection_string);
-void pcv_output_ristretto_cleanup(void);
-
 #ifdef __cplusplus
 }
 #endif
