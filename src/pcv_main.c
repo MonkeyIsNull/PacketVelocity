@@ -29,6 +29,13 @@
 #include <netinet/in.h>
 #include "vflisp_types.h"
 
+/* The RistrettoDB output backend is OPTIONAL and opt-in: its header and symbols
+ * only exist when the tree is built with `make RISTRETTO=1`. The default build
+ * stays hermetic (no RistrettoDB include, no RistrettoDB symbols). */
+#if HAVE_RISTRETTO
+#include "pcv_output.h"
+#endif
+
 /* Global handle for signal handling */
 static pcv_handle* g_handle = NULL;
 static volatile int g_running = 1;
@@ -45,6 +52,9 @@ typedef struct {
     uint32_t local_ip;
     char interface_name[32];
     bool has_ipv6;
+#if HAVE_RISTRETTO
+    pcv_output* output;   /* non-NULL => route packets to RistrettoDB, not stdout */
+#endif
 } callback_context;
 
 /* Signal handler */
@@ -235,6 +245,16 @@ static void packet_callback(const pcv_packet* packet, void* user_data) {
         }
     }
     
+#if HAVE_RISTRETTO
+    /* If an output backend is configured, route the packet there instead of
+     * streaming a tcpdump-style line to stdout. A failing append is counted by
+     * the sink and must not abort the capture loop. */
+    if (ctx && ctx->output) {
+        pcv_output_packet(ctx->output, packet);
+        return;
+    }
+#endif
+
     /* Format timestamp and packet info with direction */
     format_timestamp(packet->timestamp_ns, timestamp, sizeof(timestamp));
     uint32_t local_ip = ctx ? ctx->local_ip : 0;
@@ -259,6 +279,10 @@ static void print_usage(const char* program) {
     printf("  -b, --buffer-size <size>  Set buffer size (default: 4MB)\n");
     printf("  -c, --packet-num <count>  Stop after capturing <count> packets\n");
     printf("  -t, --seconds-num <secs>  Stop after <secs> seconds\n");
+    printf("  -o, --output <sink>       Output sink: '-'/'stdout' (default, tcpdump-style\n");
+    printf("                            stream) or 'ristretto:<path>' to append one row per\n");
+    printf("                            packet to a RistrettoDB V2 table at <path>.rdb\n");
+    printf("                            (requires a build with 'make RISTRETTO=1')\n");
     printf("  -v, --verbose             Enable verbose output\n");
     printf("  -V, --version             Show version information\n");
     printf("  -h, --help                Show this help message\n");
@@ -313,6 +337,7 @@ int main(int argc, char* argv[]) {
     const char* interface = NULL;
     const char* filter_file = NULL;
     const char* lisp_expr = NULL;
+    const char* output_spec = NULL;   /* NULL/'-'/'stdout' => tcpdump stream */
     bool promiscuous = false;
     bool immediate = false;
     bool verbose = false;
@@ -333,6 +358,7 @@ int main(int argc, char* argv[]) {
         {"buffer-size", required_argument, 0, 'b'},
         {"packet-num", required_argument, 0, 'c'},
         {"seconds-num", required_argument, 0, 't'},
+        {"output", required_argument, 0, 'o'},
         {"verbose", no_argument, 0, 'v'},
         {"version", no_argument, 0, 'V'},
         {"help", no_argument, 0, 'h'},
@@ -341,7 +367,7 @@ int main(int argc, char* argv[]) {
     
     /* Parse command line */
     int opt;
-    while ((opt = getopt_long(argc, argv, "i:f:l:pIb:c:t:vVh", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:f:l:pIb:c:t:o:vVh", long_options, NULL)) != -1) {
         switch (opt) {
         case 'i':
             interface = optarg;
@@ -366,6 +392,9 @@ int main(int argc, char* argv[]) {
             break;
         case 't':
             g_time_limit = atoi(optarg);
+            break;
+        case 'o':
+            output_spec = optarg;
             break;
         case 'v':
             verbose = true;
@@ -396,7 +425,34 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Error: Cannot specify both -f and -l options\n");
         return 1;
     }
-    
+
+    /* Resolve the output sink. Default (NULL, "-", "stdout") is the tcpdump-style
+     * stdout stream. "ristretto:<path>" routes packets to a RistrettoDB V2 table.
+     * Validate (and fast-fail the not-compiled-in case) before touching the
+     * capture device, which would otherwise need root. */
+    const char* ristretto_path = NULL;
+    if (output_spec && strcmp(output_spec, "-") != 0 &&
+        strcmp(output_spec, "stdout") != 0) {
+        if (strncmp(output_spec, "ristretto:", 10) == 0) {
+            ristretto_path = output_spec + 10;
+            if (*ristretto_path == '\0') {
+                fprintf(stderr, "Error: --output ristretto: requires a path, "
+                                "e.g. --output ristretto:/tmp/capture\n");
+                return 1;
+            }
+#if !HAVE_RISTRETTO
+            fprintf(stderr, "Error: this build has no RistrettoDB support; "
+                            "rebuild with make RISTRETTO=1\n");
+            return 1;
+#endif
+        } else {
+            fprintf(stderr, "Error: unknown --output sink '%s' "
+                            "(use '-', 'stdout', or 'ristretto:<path>')\n",
+                    output_spec);
+            return 1;
+        }
+    }
+
     /* Setup signal handling */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -482,7 +538,22 @@ int main(int argc, char* argv[]) {
     /* Store interface name for IPv6 direction detection */
     strncpy(ctx.interface_name, interface, sizeof(ctx.interface_name) - 1);
     ctx.interface_name[sizeof(ctx.interface_name) - 1] = '\0';
-    
+
+#if HAVE_RISTRETTO
+    /* Attach the RistrettoDB output backend if requested (already validated). */
+    if (ristretto_path) {
+        ctx.output = pcv_output_create(PCV_OUTPUT_RISTRETTO, ristretto_path);
+        if (!ctx.output) {
+            fprintf(stderr, "Error: Cannot open RistrettoDB output '%s'\n",
+                    ristretto_path);
+            pcv_close(g_handle);
+            if (filter) pcv_filter_destroy(filter);
+            if (filter_bytecode) free(filter_bytecode);
+            return 1;
+        }
+    }
+#endif
+
     /* Initialize start time for time limit */
     g_start_time = time(NULL);
     
@@ -515,8 +586,19 @@ int main(int argc, char* argv[]) {
         }
     }
     
+#if HAVE_RISTRETTO
+    /* Flush and close the output backend; prints the row count written. */
+    if (ctx.output) {
+        uint64_t rows = 0, pkts = 0, bytes = 0;
+        pcv_output_get_stats(ctx.output, &rows, &pkts, &bytes);
+        printf("  RistrettoDB rows:   %" PRIu64 " (packets written to table)\n", rows);
+        pcv_output_destroy(ctx.output);
+        ctx.output = NULL;
+    }
+#endif
+
     pcv_close(g_handle);
-    
+
     if (filter) {
         pcv_filter_destroy(filter);
     }

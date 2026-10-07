@@ -38,11 +38,9 @@ LINUX_LDFLAGS =
 # Point at a RistrettoDB checkout other than ../RistrettoDB with:
 #     make RISTRETTO=1 RISTRETTO_ROOT=/path/to/RistrettoDB
 #
-# NOTE: the RistrettoDB output layer (src/pcv_output_ristretto.c) currently
-# targets RistrettoDB's deprecated SQL API and still needs to be migrated to the
-# V2 append-only table API. Until that migration lands, a `RISTRETTO=1` build may
-# not compile/link against the newest RistrettoDB. See the TODO at the top of
-# src/pcv_output_ristretto.c.
+# The output layer (src/pcv_output_ristretto.c) targets the RistrettoDB V2
+# append-only table API and appends one row per captured packet. Route capture
+# to a table with: ./packetvelocity -i <if> --output ristretto:<path>
 RISTRETTO ?= 0
 RISTRETTO_ROOT ?= ../RistrettoDB
 
@@ -76,7 +74,7 @@ RISTRETTO_SOURCES =
 ifeq ($(RISTRETTO),1)
     CFLAGS += -DHAVE_RISTRETTO=1
     RISTRETTO_INCLUDES = -I$(RISTRETTO_ROOT)/embed
-    RISTRETTO_SOURCES = src/pcv_output_ristretto.c src/ristretto_stub.c
+    RISTRETTO_SOURCES = src/pcv_output_ristretto.c
     ifeq ($(BUILD_MODE),production)
         RISTRETTO_LDFLAGS = -L$(PREFIX)/lib -lristretto
     else
@@ -207,7 +205,7 @@ install-deps:
 clean:
 	rm -f $(OBJECTS) $(TARGET)
 	rm -f tests/*.o benchmarks/*.o
-	rm -f tests/test_ringbuf tests/test_flow tests/test_replay
+	rm -f tests/test_ringbuf tests/test_flow tests/test_replay tests/test_ristretto
 	rm -f examples/simple_capture
 	@echo "Cleaned build artifacts"
 
@@ -237,6 +235,13 @@ test:
 	    $(TEST_DIR)/test_replay.c $(TEST_DIR)/pcap_replay.c \
 	    src/pcv_filter_vfm.c src/pcv_flow.c $(VFLISP_SOURCES) \
 	    -o $(TEST_DIR)/test_replay $(VFM_LDFLAGS)
+ifeq ($(RISTRETTO),1)
+	@echo "Building RistrettoDB V2 sink test (RISTRETTO=1)..."
+	$(CC) $(CFLAGS) $(BASE_INCLUDES) $(RISTRETTO_INCLUDES) \
+	    $(TEST_DIR)/test_ristretto.c $(TEST_DIR)/pcap_replay.c \
+	    src/pcv_output_ristretto.c src/pcv_flow.c \
+	    -o $(TEST_DIR)/test_ristretto $(RISTRETTO_LDFLAGS)
+endif
 	@echo ""
 	@echo "=== test_ringbuf ==="
 	@./$(TEST_DIR)/test_ringbuf
@@ -246,6 +251,11 @@ test:
 	@echo ""
 	@echo "=== test_replay (pcap replay -> filter -> flow pipeline) ==="
 	@./$(TEST_DIR)/test_replay
+ifeq ($(RISTRETTO),1)
+	@echo ""
+	@echo "=== test_ristretto (RistrettoDB V2 sink round-trip) ==="
+	@./$(TEST_DIR)/test_ristretto
+endif
 	@echo ""
 	@echo "All tests passed."
 
@@ -282,10 +292,9 @@ help:
 	@echo ""
 	@echo ""
 	@echo "Optional RistrettoDB output backend (opt-in, default OFF):"
-	@echo "  make RISTRETTO=1        - Build with the RistrettoDB output backend"
+	@echo "  make RISTRETTO=1        - Build with the RistrettoDB V2 output backend"
 	@echo "  make RISTRETTO=1 RISTRETTO_ROOT=/path - Use a specific RistrettoDB checkout"
-	@echo "  (NOTE: the output layer still targets the deprecated SQL API and may"
-	@echo "   not link against the newest RistrettoDB until the V2 migration.)"
+	@echo "  then: ./packetvelocity -i <if> --output ristretto:<path>  (writes <path>.rdb)"
 	@echo ""
 	@echo "Other targets:"
 	@echo "  make debug              - Build with debug symbols"

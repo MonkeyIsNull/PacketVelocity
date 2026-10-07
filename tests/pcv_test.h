@@ -120,4 +120,64 @@ static size_t pcv_build_ipv4_frame(uint8_t* buf, size_t buf_size,
     return total;
 }
 
+/* Build an Ethernet + IPv6 + (TCP|UDP) frame into buf.
+ * src_ip6/dst_ip6 are 16-byte IPv6 addresses in network byte order.
+ * proto is 6 (TCP) or 17 (UDP); for other protocols no L4 ports are added.
+ * Returns the total frame length in bytes (0 if it would not fit).
+ */
+static size_t pcv_build_ipv6_frame(uint8_t* buf, size_t buf_size,
+                                   uint8_t proto,
+                                   const uint8_t src_ip6[16],
+                                   const uint8_t dst_ip6[16],
+                                   uint16_t src_port, uint16_t dst_port,
+                                   uint8_t tcp_flags,
+                                   size_t payload_len) {
+    const size_t eth_len = 14;
+    const size_t ip6_len = 40;           /* fixed IPv6 header */
+    size_t l4_len = 0;
+    if (proto == 6) l4_len = 20;         /* minimal TCP header */
+    else if (proto == 17) l4_len = 8;    /* UDP header */
+
+    size_t total = eth_len + ip6_len + l4_len + payload_len;
+    if (total > buf_size) return 0;
+    memset(buf, 0, total);
+
+    /* Ethernet: dst MAC, src MAC, ethertype 0x86DD (IPv6) */
+    static const uint8_t dmac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+    static const uint8_t smac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x02};
+    memcpy(buf + 0, dmac, 6);
+    memcpy(buf + 6, smac, 6);
+    buf[12] = 0x86;
+    buf[13] = 0xDD;
+
+    /* IPv6 header */
+    uint8_t* ip6 = buf + eth_len;
+    ip6[0] = 0x60;                       /* version 6, traffic class 0 */
+    uint16_t payload = (uint16_t)(l4_len + payload_len);
+    ip6[4] = (uint8_t)(payload >> 8);    /* payload length (excludes IPv6 hdr) */
+    ip6[5] = (uint8_t)(payload & 0xFF);
+    ip6[6] = proto;                      /* next header */
+    ip6[7] = 64;                         /* hop limit */
+    memcpy(ip6 + 8, src_ip6, 16);        /* source address */
+    memcpy(ip6 + 24, dst_ip6, 16);       /* destination address */
+
+    /* L4 */
+    if (l4_len > 0) {
+        uint8_t* l4 = ip6 + ip6_len;
+        uint16_t sp = htons(src_port), dp = htons(dst_port);
+        memcpy(l4 + 0, &sp, 2);
+        memcpy(l4 + 2, &dp, 2);
+        if (proto == 6) {
+            l4[12] = 0x50;               /* data offset 5 (20 bytes) */
+            l4[13] = tcp_flags;
+        } else {
+            uint16_t ulen = (uint16_t)(l4_len + payload_len);
+            l4[4] = (uint8_t)(ulen >> 8);
+            l4[5] = (uint8_t)(ulen & 0xFF);
+        }
+    }
+
+    return total;
+}
+
 #endif /* PCV_TEST_H */

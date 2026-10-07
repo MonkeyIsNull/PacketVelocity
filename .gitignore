@@ -81,4 +81,5 @@ CLAUDE.md
 /tests/test_ringbuf
 /tests/test_flow
 /tests/test_replay
+/tests/test_ristretto
 

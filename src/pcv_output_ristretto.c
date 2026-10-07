@@ -5,400 +5,272 @@
  * The DEFAULT build is hermetic (terminal/stdout stream, like tcpdump) and does
  * NOT compile or link this file or any RistrettoDB code.
  *
- * TODO (later task - RistrettoDB V2 migration):
- *   This output layer still targets RistrettoDB's DEPRECATED SQL API
- *   (ristretto_open / ristretto_exec / ristretto_close / RISTRETTO_OK, ...).
- *   RistrettoDB has pivoted to a V2 append-only *table* API
- *   (ristretto_table_create / ristretto_table_append_row / ristretto_value_* ,
- *    see <RistrettoDB>/embed/ristretto.h). This code must be migrated to that
- *   V2 API AND wired into the capture loop (pcv_main.c currently does not call
- *   the output layer at all - it only streams to stdout).
+ * This backend targets the RistrettoDB *V2* append-only, fixed-width table API
+ * (ristretto_table_* / ristretto_value_*, see <RistrettoDB>/embed/ristretto.h).
+ * There is no SQL, no UPDATE/DELETE, and exactly one writer: we create a table,
+ * append ONE ROW PER CAPTURED PACKET, and close it. Per-packet (rather than
+ * per-flow) rows keep the mapping between captured packets and stored rows
+ * exact and deterministic, which the append-only model is built for.
  *
- *   Because of the deprecated API, a `RISTRETTO=1` build may NOT compile/link
- *   against the newest RistrettoDB until that migration lands. This is expected.
+ * -----------------------------------------------------------------------------
+ * SCHEMA (fixed-width; IPv6-friendly). Column types are the only ones V2
+ * offers: INTEGER (8 bytes), REAL (8 bytes), TEXT(n) (n<=255 bytes, stores
+ * up to n-1 chars + NUL). Table name: "packets".
+ *
+ *   ts_ns        INTEGER   packet timestamp, nanoseconds since the epoch
+ *   src_ip       TEXT(46)  source address, inet_ntop (AF_INET / AF_INET6)
+ *   dst_ip       TEXT(46)  destination address, inet_ntop
+ *   src_port     INTEGER   L4 source port in host order (0 if no L4 ports)
+ *   dst_port     INTEGER   L4 destination port in host order
+ *   protocol     INTEGER   IP protocol number (6=TCP, 17=UDP, ...)
+ *   addr_family  INTEGER   4 (IPv4) or 6 (IPv6)
+ *   length       INTEGER   original on-wire packet length
+ *   caplen       INTEGER   captured length (<= length)
+ *
+ * IPv6 storage: addresses are kept as TEXT formatted with inet_ntop, so a full
+ * IPv6 or IPv4-mapped literal round-trips unchanged. INET6_ADDRSTRLEN (46) is
+ * the width: the longest textual address is 45 chars, and the V2 packer keeps
+ * up to (width-1) chars + NUL, i.e. 45 usable chars in a TEXT(46) column.
  * =============================================================================
  */
-#define _POSIX_C_SOURCE 200809L  /* For strdup */
+#define _POSIX_C_SOURCE 200809L           /* strdup, inet_ntop prototypes */
+#define RISTRETTO_NO_COMPATIBILITY_LAYER  /* only the prefixed ristretto_* API */
+
 #include "pcv_output.h"
 #include "pcv_flow.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <inttypes.h>
-#include <time.h>
 #include <arpa/inet.h>
 
-#if HAVE_RISTRETTO
 #include "ristretto.h"
+
+/* Number of columns; must match PCV_RISTRETTO_SCHEMA below. */
+#define PCV_RISTRETTO_NUM_COLS 9
+
+/* INET6_ADDRSTRLEN is 46 on every supported platform; the schema string must
+ * use a literal, so assert the assumption instead of silently diverging. */
+#if INET6_ADDRSTRLEN > 46
+#error "INET6_ADDRSTRLEN exceeds the src_ip/dst_ip TEXT(46) column width"
 #endif
 
-/* RistrettoDB output stub implementation
- * This is a placeholder for actual RistrettoDB integration
- * Replace with real implementation using:
- * https://github.com/MonkeyIsNull/RistrettoDB
- */
+#define PCV_RISTRETTO_SCHEMA \
+    "CREATE TABLE packets (" \
+    "ts_ns INTEGER, " \
+    "src_ip TEXT(46), " \
+    "dst_ip TEXT(46), " \
+    "src_port INTEGER, " \
+    "dst_port INTEGER, " \
+    "protocol INTEGER, " \
+    "addr_family INTEGER, " \
+    "length INTEGER, " \
+    "caplen INTEGER)"
 
 typedef struct pcv_ristretto_context {
-    char* database_file;
-#if HAVE_RISTRETTO
-    RistrettoDB* db;
-#else
-    void* db;  /* Placeholder when RistrettoDB is not available */
-#endif
-    
-    /* Flow aggregation */
-    pcv_flow_table* flow_table;
-    pcv_flow_config flow_config;
-    
-    /* Bulk insert configuration */
-    uint32_t batch_size;
-    uint32_t current_batch_count;
-    
-    /* Timing */
-    time_t last_flush;
-    uint64_t flush_interval_ns;
-    
-    /* Statistics */
-    uint64_t total_inserts;
-    uint64_t total_flushes;
+    RistrettoTable* table;
+    char* base_dir;   /* directory the .rdb file lives in */
+    char* name;       /* table name (basename, no .rdb suffix) */
     uint64_t insert_errors;
-    
-    /* Fallback logging */
-    FILE* log_file;
 } pcv_ristretto_context;
 
-/* Initialize RistrettoDB database and table */
-static int init_ristretto_database(pcv_ristretto_context* ctx) {
-#if HAVE_RISTRETTO
-    const char* schema_sql = 
-        "CREATE TABLE IF NOT EXISTS packet_flows ("
-        "flow_id INTEGER PRIMARY KEY, "
-        "src_ip TEXT, "
-        "dst_ip TEXT, "
-        "src_port INTEGER, "
-        "dst_port INTEGER, "
-        "protocol INTEGER, "
-        "first_seen INTEGER, "
-        "last_seen INTEGER, "
-        "duration_ms INTEGER, "
-        "packet_count INTEGER, "
-        "byte_count INTEGER, "
-        "tcp_flags INTEGER, "
-        "flow_state INTEGER"
-        ")";
-    
-    /* Open the database */
-    ctx->db = ristretto_open(ctx->database_file);
-    if (!ctx->db) {
-        fprintf(stderr, "Failed to open RistrettoDB database: %s\n", ctx->database_file);
-        return -1;
-    }
-    
-    /* Create the table */
-    RistrettoResult result = ristretto_exec(ctx->db, schema_sql);
-    if (result != RISTRETTO_OK) {
-        fprintf(stderr, "Failed to create packet_flows table: %s\n", ristretto_error_string(result));
-        ristretto_close(ctx->db);
-        ctx->db = NULL;
-        return -1;
-    }
-    
-    printf("RistrettoDB database initialized successfully: %s\n", ctx->database_file);
-    return 0;
-#else
-    printf("RistrettoDB support not compiled in - using stub implementation\n");
-    ctx->db = NULL;
-    return 0;
-#endif
-}
+/* Split a user target ("ristretto:<target>") into the (base_dir, name) pair the
+ * V2 library expects; it stores the table at "<base_dir>/<name>.rdb". A missing
+ * directory becomes ".", and a trailing ".rdb" on the target is stripped so
+ * "pkts" and "pkts.rdb" resolve to the same file. Returns 0 on success. */
+static int split_target(const char* target, char** out_dir, char** out_name) {
+    const char* slash = strrchr(target, '/');
+    const char* base  = slash ? slash + 1 : target;
+    size_t dirlen = slash ? (size_t)(slash - target) : 0;
 
-/* Convert IP address to string */
-static void ip_to_string(uint32_t ip, char* buffer, size_t size) {
-    inet_ntop(AF_INET, &ip, buffer, size);
-}
-
-/* Insert flow into RistrettoDB table using SQL */
-static int insert_flow_to_database(pcv_ristretto_context* ctx, const pcv_flow_stats* flow) {
-    char src_ip_str[16], dst_ip_str[16];
-    char sql_buffer[1024];
-    
-    /* Convert IP addresses to strings */
-    ip_to_string(flow->key.src_ip, src_ip_str, sizeof(src_ip_str));
-    ip_to_string(flow->key.dst_ip, dst_ip_str, sizeof(dst_ip_str));
-    
-    /* Build INSERT statement */
-    snprintf(sql_buffer, sizeof(sql_buffer),
-        "INSERT INTO packet_flows ("
-        "flow_id, src_ip, dst_ip, src_port, dst_port, protocol, "
-        "first_seen, last_seen, duration_ms, packet_count, byte_count, tcp_flags, flow_state"
-        ") VALUES ("
-        "%u, '%s', '%s', %u, %u, %u, "
-        "%" PRIu64 ", %" PRIu64 ", %" PRIu64 ", %" PRIu64 ", %" PRIu64 ", %u, %u"
-        ")",
-        flow->flow_id, src_ip_str, dst_ip_str,
-        flow->key.src_port, flow->key.dst_port, flow->key.protocol,
-        flow->first_seen_ns / 1000000000,  /* Unix timestamp */
-        flow->last_seen_ns / 1000000000,
-        flow->duration_ns / 1000000,       /* Milliseconds */
-        flow->packet_count, flow->byte_count,
-        flow->tcp_flags, flow->flow_state
-    );
-    
-    /* Execute the insert */
-#if HAVE_RISTRETTO
-    RistrettoResult result = ristretto_exec(ctx->db, sql_buffer);
-    if (result == RISTRETTO_OK) {
-        ctx->total_inserts++;
-        ctx->current_batch_count++;
-        return 0;
+    char* dir = malloc(dirlen ? dirlen + 1 : 2);
+    if (!dir) return -1;
+    if (dirlen) {
+        memcpy(dir, target, dirlen);
+        dir[dirlen] = '\0';
     } else {
-        ctx->insert_errors++;
-        fprintf(stderr, "Failed to insert flow: %s\n", ristretto_error_string(result));
+        dir[0] = '.';
+        dir[1] = '\0';
+    }
+
+    size_t namelen = strlen(base);
+    const size_t extlen = 4;  /* ".rdb" */
+    if (namelen > extlen && strcmp(base + namelen - extlen, ".rdb") == 0) {
+        namelen -= extlen;
+    }
+    if (namelen == 0) {
+        free(dir);
         return -1;
     }
-#else
-    /* Stub implementation - just log to file if available */
-    if (ctx->log_file) {
-        fprintf(ctx->log_file, "%s\n", sql_buffer);
-        fflush(ctx->log_file);
+
+    char* name = malloc(namelen + 1);
+    if (!name) {
+        free(dir);
+        return -1;
     }
-    ctx->total_inserts++;
-    ctx->current_batch_count++;
+    memcpy(name, base, namelen);
+    name[namelen] = '\0';
+
+    *out_dir = dir;
+    *out_name = name;
     return 0;
-#endif
 }
 
-/* Bulk insert callback for flow iteration */
-static void bulk_insert_callback(const pcv_flow_stats* flow, void* user_data) {
-    pcv_ristretto_context* ctx = (pcv_ristretto_context*)user_data;
-    
-    /* Only insert completed or expired flows */
-    if (!(flow->flow_state & (PCV_FLOW_TIMEOUT | PCV_FLOW_FINISHED))) {
-        return;
-    }
-    
-    insert_flow_to_database(ctx, flow);
-}
-
-/* Create output handler */
+/* Create output handler: create (or truncate) the V2 table. */
 pcv_output* pcv_output_create(pcv_output_type type, const char* target) {
-    pcv_output* output;
-    pcv_ristretto_context* ctx;
-    
     if (type != PCV_OUTPUT_RISTRETTO) {
         return NULL;
     }
-    
-    output = calloc(1, sizeof(pcv_output));
+    if (!target || !*target) {
+        target = "packets";
+    }
+
+    pcv_output* output = calloc(1, sizeof(pcv_output));
     if (!output) {
         return NULL;
     }
-    
-    ctx = calloc(1, sizeof(pcv_ristretto_context));
+
+    pcv_ristretto_context* ctx = calloc(1, sizeof(pcv_ristretto_context));
     if (!ctx) {
         free(output);
         return NULL;
     }
-    
-    /* Initialize output */
+
+    if (split_target(target, &ctx->base_dir, &ctx->name) != 0) {
+        fprintf(stderr, "pcv_output: invalid RistrettoDB target '%s'\n", target);
+        free(ctx);
+        free(output);
+        return NULL;
+    }
+
+    ctx->table = ristretto_table_create_ex(ctx->name, PCV_RISTRETTO_SCHEMA,
+                                           ctx->base_dir,
+                                           RISTRETTO_CREATE_OR_TRUNCATE);
+    if (!ctx->table) {
+        fprintf(stderr,
+                "pcv_output: failed to create RistrettoDB table '%s/%s.rdb'\n",
+                ctx->base_dir, ctx->name);
+        free(ctx->base_dir);
+        free(ctx->name);
+        free(ctx);
+        free(output);
+        return NULL;
+    }
+
     output->type = type;
     output->context = ctx;
-    output->flush_interval_ms = 1000;  /* 1 second default */
-    output->max_flows = 100000;  /* Increased capacity */
-    
-    /* Save database file path */
-    ctx->database_file = strdup(target ? target : "packet_flows.db");
-    
-    /* Initialize RistrettoDB database */
-    if (init_ristretto_database(ctx) < 0) {
-        free(ctx->database_file);
-        free(ctx);
-        free(output);
-        return NULL;
-    }
-    
-    /* Configure flow aggregation */
-    ctx->flow_config.max_flows = 50000;
-    ctx->flow_config.hash_buckets = 65536;
-    ctx->flow_config.flow_timeout_ms = 300000;  /* 5 minutes */
-    ctx->flow_config.cleanup_interval = 1000;
-    ctx->flow_config.enable_tcp_state = true;
-    
-    /* Create flow table */
-    ctx->flow_table = pcv_flow_table_create(&ctx->flow_config);
-    if (!ctx->flow_table) {
-#if HAVE_RISTRETTO
-        if (ctx->db) {
-            ristretto_close(ctx->db);
-        }
-#endif
-        free(ctx->database_file);
-        free(ctx);
-        free(output);
-        return NULL;
-    }
-    
-    /* Set configurable flush intervals and thresholds */
-    ctx->batch_size = output->max_flows / 50;  /* Adaptive batch size based on capacity */
-    if (ctx->batch_size < 100) ctx->batch_size = 100;      /* Minimum batch size */
-    if (ctx->batch_size > 5000) ctx->batch_size = 5000;    /* Maximum batch size */
-    
-    ctx->flush_interval_ns = (uint64_t)output->flush_interval_ms * 1000000ULL;  /* Convert ms to ns */
-    ctx->last_flush = time(NULL);
-    
-    /* Open fallback log file */
-    char log_filename[256];
-    snprintf(log_filename, sizeof(log_filename), "%s.log", ctx->database_file);
-    ctx->log_file = fopen(log_filename, "a");
-    if (!ctx->log_file) {
-        ctx->log_file = stdout;
-    }
-    
-    printf("RistrettoDB database initialized: %s\n", ctx->database_file);
-    printf("Flow table capacity: %u flows, %u buckets\n", 
-           ctx->flow_config.max_flows, ctx->flow_config.hash_buckets);
-    printf("Flush configuration: batch_size=%u, interval=%" PRIu64 " ms\n",
-           ctx->batch_size, (uint64_t)(ctx->flush_interval_ns / 1000000ULL));
-    
+    output->flush_interval_ms = 1000;
+
+    fprintf(stderr, "pcv_output: writing packets to RistrettoDB table %s/%s.rdb\n",
+            ctx->base_dir, ctx->name);
     return output;
 }
 
-/* Destroy output handler */
+/* Destroy output handler: durably flush and close the table. */
 void pcv_output_destroy(pcv_output* output) {
-    if (!output) return;
-    
-    /* Flush any remaining data */
-    pcv_output_flush(output);
-    
-    if (output->type == PCV_OUTPUT_RISTRETTO && output->context) {
-        pcv_ristretto_context* ctx = output->context;
-        
-        /* Close RistrettoDB database */
-        if (ctx->db) {
-#if HAVE_RISTRETTO
-            ristretto_close(ctx->db);
-#endif
+    if (!output) {
+        return;
+    }
+
+    pcv_ristretto_context* ctx = (pcv_ristretto_context*)output->context;
+    if (ctx) {
+        if (ctx->table) {
+            ristretto_table_flush_durable(ctx->table);
+            ristretto_table_close(ctx->table);
         }
-        
-        /* Destroy flow table */
-        if (ctx->flow_table) {
-            pcv_flow_table_destroy(ctx->flow_table);
-        }
-        
-        /* Close log file */
-        if (ctx->log_file && ctx->log_file != stdout) {
-            fclose(ctx->log_file);
-        }
-        
-        printf("RistrettoDB statistics:\n");
-        printf("  Total inserts: %" PRIu64 "\n", ctx->total_inserts);
-        printf("  Total flushes: %" PRIu64 "\n", ctx->total_flushes);
-        printf("  Insert errors: %" PRIu64 "\n", ctx->insert_errors);
-        
-        free(ctx->database_file);
+        fprintf(stderr,
+                "pcv_output: wrote %" PRIu64 " rows (%" PRIu64 " errors) to %s/%s.rdb\n",
+                output->total_flows, ctx->insert_errors,
+                ctx->base_dir ? ctx->base_dir : "?",
+                ctx->name ? ctx->name : "?");
+        free(ctx->base_dir);
+        free(ctx->name);
         free(ctx);
     }
-    
+
     free(output);
 }
 
-/* Process packet */
+/* Append one row for a captured packet. Never aborts the capture loop: parse
+ * failures are skipped and append failures are counted and reported via the
+ * return code. */
 int pcv_output_packet(pcv_output* output, const pcv_packet* packet) {
-    pcv_ristretto_context* ctx;
-    time_t now;
-    
     if (!output || !packet) {
         return -1;
     }
-    
-    ctx = (pcv_ristretto_context*)output->context;
-    
-    /* Update flow table with packet */
-    if (pcv_flow_update(ctx->flow_table, packet) < 0) {
-        /* Flow table might be full, try flushing */
-        pcv_output_flush(output);
-        if (pcv_flow_update(ctx->flow_table, packet) < 0) {
-            return -1;
-        }
+
+    pcv_ristretto_context* ctx = (pcv_ristretto_context*)output->context;
+    if (!ctx || !ctx->table) {
+        return -1;
     }
-    
-    /* Update totals */
+
+    pcv_flow_key_v6 key;
+    if (pcv_flow_extract_key_v6(packet, &key) != 0) {
+        /* Not an IP packet we can parse - skip it without erroring. */
+        return 0;
+    }
+
+    char src_ip[INET6_ADDRSTRLEN];
+    char dst_ip[INET6_ADDRSTRLEN];
+    if (key.addr_family == PCV_ADDR_IPV6) {
+        inet_ntop(AF_INET6, key.src_ip.ipv6, src_ip, sizeof(src_ip));
+        inet_ntop(AF_INET6, key.dst_ip.ipv6, dst_ip, sizeof(dst_ip));
+    } else {
+        inet_ntop(AF_INET, &key.src_ip.ipv4, src_ip, sizeof(src_ip));
+        inet_ntop(AF_INET, &key.dst_ip.ipv4, dst_ip, sizeof(dst_ip));
+    }
+
+    RistrettoValue v[PCV_RISTRETTO_NUM_COLS];
+    v[0] = ristretto_value_integer((int64_t)packet->timestamp_ns);
+    v[1] = ristretto_value_text(src_ip);
+    v[2] = ristretto_value_text(dst_ip);
+    v[3] = ristretto_value_integer((int64_t)key.src_port);
+    v[4] = ristretto_value_integer((int64_t)key.dst_port);
+    v[5] = ristretto_value_integer((int64_t)key.protocol);
+    v[6] = ristretto_value_integer((int64_t)key.addr_family);
+    v[7] = ristretto_value_integer((int64_t)packet->length);
+    v[8] = ristretto_value_integer((int64_t)packet->captured_length);
+
+    bool ok = ristretto_table_append_row_n(ctx->table, v, PCV_RISTRETTO_NUM_COLS);
+
+    /* Only the TEXT values own heap memory. */
+    ristretto_value_destroy(&v[1]);
+    ristretto_value_destroy(&v[2]);
+
     output->total_packets++;
     output->total_bytes += packet->captured_length;
-    
-    /* Check if flush needed based on time */
-    now = time(NULL);
-    if ((now - ctx->last_flush) * 1000 >= output->flush_interval_ms) {
-        pcv_output_flush(output);
-        ctx->last_flush = now;
+
+    if (!ok) {
+        ctx->insert_errors++;
+        fprintf(stderr, "pcv_output: failed to append packet row\n");
+        return -1;
     }
-    
-    /* Check if flush needed based on batch size */
-    if (ctx->current_batch_count >= ctx->batch_size) {
-        pcv_output_flush(output);
-    }
-    
+
+    output->total_flows++;  /* reused as "rows written" */
     return 0;
 }
 
-/* Flush buffered data */
+/* Flush buffered data to disk (fast, async). */
 int pcv_output_flush(pcv_output* output) {
-    pcv_ristretto_context* ctx;
-    uint64_t current_time_ns;
-    
     if (!output) {
         return 0;
     }
-    
-    ctx = (pcv_ristretto_context*)output->context;
-    current_time_ns = time(NULL) * 1000000000ULL;  /* Approximate */
-    
-    /* Expire old flows */
-    int expired = pcv_flow_expire_old(ctx->flow_table, current_time_ns);
-    
-    if (expired == 0) {
-        return 0;  /* Nothing to flush */
+    pcv_ristretto_context* ctx = (pcv_ristretto_context*)output->context;
+    if (ctx && ctx->table) {
+        ristretto_table_flush(ctx->table);
     }
-    
-    /* Reset batch counter for this flush */
-    ctx->current_batch_count = 0;
-    
-    /* Iterate through flows and insert expired/finished ones */
-    pcv_flow_iterate(ctx->flow_table, bulk_insert_callback, ctx);
-    
-    /* Update statistics */
-    if (ctx->current_batch_count > 0) {
-        ctx->total_flushes++;
-        printf("Flushed %u flows to RistrettoDB\n", ctx->current_batch_count);
-    }
-    
-    /* Update statistics */
-    output->total_flows += expired;
-    
-    return expired;
+    return 0;
 }
 
 /* Get output statistics */
 void pcv_output_get_stats(const pcv_output* output, uint64_t* flows,
                           uint64_t* packets, uint64_t* bytes) {
-    if (!output) return;
-    
-    if (flows) *flows = output->total_flows;
+    if (!output) {
+        return;
+    }
+    if (flows)   *flows   = output->total_flows;
     if (packets) *packets = output->total_packets;
-    if (bytes) *bytes = output->total_bytes;
-}
-
-/* RistrettoDB specific initialization */
-int pcv_output_ristretto_init(const char* connection_string) {
-    /* TODO: Initialize RistrettoDB connection */
-    (void)connection_string;
-    printf("RistrettoDB stub: Would connect to %s\n", 
-           connection_string ? connection_string : "default");
-    return 0;
-}
-
-void pcv_output_ristretto_cleanup(void) {
-    /* TODO: Cleanup RistrettoDB connection */
-    printf("RistrettoDB stub: Cleanup\n");
+    if (bytes)   *bytes   = output->total_bytes;
 }
