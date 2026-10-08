@@ -63,7 +63,13 @@ typedef struct pcv_flow_key {
 /* Flow statistics */
 typedef struct pcv_flow_stats {
     pcv_flow_key key;
-    
+
+    /* IPv4/IPv6 5-tuple key. Populated by the IPv6-capable aggregation path
+     * (pcv_flow_update_v6); the legacy IPv4 path (pcv_flow_update) leaves it
+     * zeroed and uses `key` above. Kept additive so neither path disturbs the
+     * other and the existing IPv4 API/tests are unchanged. */
+    pcv_flow_key_v6 key6;
+
     /* Timing */
     uint64_t first_seen_ns;
     uint64_t last_seen_ns;
@@ -106,6 +112,15 @@ typedef struct pcv_flow_table {
     uint64_t total_flows;
     uint64_t expired_flows;
     uint64_t hash_collisions;
+
+    /* Optional expiry hook. When set, pcv_flow_expire_old invokes it EXACTLY
+     * ONCE per flow - at the moment the flow transitions out of PCV_FLOW_ACTIVE
+     * (timeout or TCP FIN). NULL by default, so existing callers see unchanged
+     * behaviour. The per-flow RistrettoDB sink uses this to emit one row per
+     * flow on eviction, then flushes the still-open flows at shutdown by calling
+     * pcv_flow_expire_old with a future timestamp. */
+    void (*on_expire)(const struct pcv_flow_stats* flow, void* user);
+    void* expire_ctx;
 } pcv_flow_table;
 
 /* Flow aggregation configuration */
@@ -121,10 +136,23 @@ typedef struct pcv_flow_config {
 pcv_flow_table* pcv_flow_table_create(const pcv_flow_config* config);
 void pcv_flow_table_destroy(pcv_flow_table* table);
 
-/* Flow operations */
+/* Flow operations - Legacy IPv4 API (keys by pcv_flow_key) */
 int pcv_flow_update(pcv_flow_table* table, const pcv_packet* packet);
 pcv_flow_stats* pcv_flow_lookup(pcv_flow_table* table, const pcv_flow_key* key);
 int pcv_flow_expire_old(pcv_flow_table* table, uint64_t current_time_ns);
+
+/* Flow operations - IPv4/IPv6 API (keys by pcv_flow_key_v6). Aggregates the
+ * same pcv_flow_stats into the same table, but tracks the full IPv4/IPv6
+ * 5-tuple so IPv6 flows are supported. A given table must be driven by only one
+ * of the two update APIs. */
+int pcv_flow_update_v6(pcv_flow_table* table, const pcv_packet* packet);
+pcv_flow_stats* pcv_flow_lookup_v6(pcv_flow_table* table, const pcv_flow_key_v6* key);
+
+/* Register an optional expiry hook (see pcv_flow_table.on_expire). Passing NULL
+ * clears it. Returns 0 on success, -1 on a NULL table. */
+int pcv_flow_table_set_expire_cb(pcv_flow_table* table,
+                                 void (*cb)(const pcv_flow_stats* flow, void* user),
+                                 void* user);
 
 /* Flow key extraction - Legacy IPv4 API */
 int pcv_flow_extract_key(const pcv_packet* packet, pcv_flow_key* key);

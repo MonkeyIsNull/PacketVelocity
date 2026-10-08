@@ -18,6 +18,11 @@
 #define FNV_PRIME_32 0x01000193
 #define FNV_OFFSET_32 0x811c9dc5
 
+/* Defined in the IPv6 section below; forward-declared so the shared per-packet
+ * aggregation helper can locate the L4 header for IPv6 frames too. */
+static bool is_ipv6_extension_header(uint8_t protocol);
+static uint16_t get_ipv6_extension_header_length(uint8_t protocol, const uint8_t* header);
+
 static uint32_t fnv1a_hash(const void* data, size_t len) {
     const uint8_t* bytes = (const uint8_t*)data;
     uint32_t hash = FNV_OFFSET_32;
@@ -207,20 +212,104 @@ pcv_flow_stats* pcv_flow_lookup(pcv_flow_table* table, const pcv_flow_key* key) 
     return flow_table_find(table, key);
 }
 
+/* Byte offset (from the start of the Ethernet frame) of the L4 header, and the
+ * resolved L4 protocol. Returns false if the frame is too short or not IPv4/
+ * IPv6. Mirrors the offset walk in pcv_flow_extract_key_v6 (including IPv6
+ * extension headers) so TCP flags are read from the right place for both
+ * address families, not just IPv4. */
+static bool l4_header_offset(const pcv_packet* packet, uint32_t* out_off,
+                             uint8_t* out_proto) {
+    const uint8_t* data = packet->data;
+    uint32_t len = packet->captured_length;
+    if (len < 34) {
+        return false;
+    }
+
+    const uint8_t* ip = data + 14;  /* skip Ethernet */
+    uint8_t version = (ip[0] >> 4) & 0x0F;
+
+    if (version == 4) {
+        uint8_t ihl = (ip[0] & 0x0F) * 4;
+        *out_proto = ip[9];
+        *out_off = 14 + ihl;
+        return true;
+    } else if (version == 6) {
+        if (len < 54) {
+            return false;
+        }
+        uint8_t next = ip[6];
+        uint16_t off = 40;  /* fixed IPv6 header */
+        while (is_ipv6_extension_header(next) && (uint32_t)(14 + off) < len) {
+            if ((uint32_t)(14 + off + 2) > len) {
+                break;
+            }
+            const uint8_t* eh = ip + off;
+            uint16_t elen = get_ipv6_extension_header_length(next, eh);
+            if (elen == 0 || (off + elen) > len) {
+                break;
+            }
+            next = eh[0];
+            off += elen;
+        }
+        *out_proto = next;
+        *out_off = 14 + off;
+        return true;
+    }
+
+    return false;
+}
+
+/* Apply one packet's contribution to a flow's aggregates and run the table's
+ * periodic cleanup. Shared by the IPv4 (pcv_flow_update) and IPv4/IPv6
+ * (pcv_flow_update_v6) aggregation paths so both accumulate identically.
+ * `protocol` is the resolved L4 protocol from the caller's extracted key (only
+ * TCP needs the header re-parse for flags). */
+static void flow_record_packet(pcv_flow_table* table, pcv_flow_stats* flow,
+                               const pcv_packet* packet, uint8_t protocol) {
+    /* Update flow statistics */
+    flow->last_seen_ns = packet->timestamp_ns;
+    flow->duration_ns = flow->last_seen_ns - flow->first_seen_ns;
+    flow->packet_count++;
+    flow->byte_count += packet->captured_length;
+
+    /* Update TCP flags if applicable (IPv4 or IPv6). */
+    if (protocol == 6) {  /* TCP */
+        uint32_t l4_off = 0;
+        uint8_t l4_proto = 0;
+        if (l4_header_offset(packet, &l4_off, &l4_proto) && l4_proto == 6 &&
+            packet->captured_length >= (uint32_t)(l4_off + 14)) {
+            uint8_t tcp_flags = packet->data[l4_off + 13];
+            flow->tcp_flags |= tcp_flags;
+
+            /* Update flow state based on TCP flags */
+            if (tcp_flags & 0x01) {  /* FIN */
+                flow->flow_state |= PCV_FLOW_FINISHED;
+            }
+        }
+    }
+
+    /* Periodic cleanup */
+    table->packet_counter++;
+    if (table->packet_counter >= table->cleanup_interval) {
+        pcv_flow_expire_old(table, packet->timestamp_ns);
+        table->packet_counter = 0;
+    }
+}
+
 /* Update flow with new packet */
 int pcv_flow_update(pcv_flow_table* table, const pcv_packet* packet) {
     pcv_flow_key key;
     pcv_flow_stats* flow;
-    
+
     if (!table || !packet) {
         return -1;
     }
-    
+
     /* Extract flow key from packet */
     if (pcv_flow_extract_key(packet, &key) < 0) {
         return -1;
     }
-    
+
     /* Find existing flow or create new one */
     flow = flow_table_find(table, &key);
     if (!flow) {
@@ -228,40 +317,138 @@ int pcv_flow_update(pcv_flow_table* table, const pcv_packet* packet) {
         if (!flow) {
             return -1;  /* Failed to create flow */
         }
-        
+
         /* Initialize flow timing */
         flow->first_seen_ns = packet->timestamp_ns;
     }
-    
-    /* Update flow statistics */
-    flow->last_seen_ns = packet->timestamp_ns;
-    flow->duration_ns = flow->last_seen_ns - flow->first_seen_ns;
-    flow->packet_count++;
-    flow->byte_count += packet->captured_length;
-    
-    /* Update TCP flags if applicable */
-    if (key.protocol == 6 && packet->captured_length >= 34) {  /* TCP */
-        const uint8_t* ip_header = packet->data + 14;
-        uint8_t ip_header_len = (ip_header[0] & 0x0F) * 4;
-        if (packet->captured_length >= (uint32_t)(14 + ip_header_len + 14)) {
-            const uint8_t* tcp_header = ip_header + ip_header_len;
-            uint8_t tcp_flags = tcp_header[13];
-            flow->tcp_flags |= tcp_flags;
-            
-            /* Update flow state based on TCP flags */
-            if (tcp_flags & 0x01) {  /* FIN */
-                flow->flow_state |= PCV_FLOW_FINISHED;
-            }
+
+    flow_record_packet(table, flow, packet, key.protocol);
+    return 0;
+}
+
+/* ---- IPv4/IPv6 aggregation path (keys by pcv_flow_key_v6) --------------- */
+
+/* Find a flow by its IPv4/IPv6 5-tuple key. */
+static pcv_flow_stats* flow_table_find_v6(pcv_flow_table* table,
+                                          const pcv_flow_key_v6* key) {
+    uint32_t hash = pcv_flow_hash_key_v6(key);
+    uint32_t start = hash % table->bucket_count;
+    uint32_t bucket = start;
+    uint32_t flow_idx = table->buckets[bucket];
+
+    while (flow_idx != UINT32_MAX) {
+        pcv_flow_stats* flow = &table->flows[flow_idx];
+        if (pcv_flow_key_v6_compare(&flow->key6, key) == 0) {
+            return flow;
+        }
+
+        /* Linear probing for collision resolution */
+        bucket = (bucket + 1) % table->bucket_count;
+        flow_idx = table->buckets[bucket];
+
+        if (bucket == start) {
+            break;  /* Avoid infinite loop */
         }
     }
-    
-    /* Periodic cleanup */
-    table->packet_counter++;
-    if (table->packet_counter >= table->cleanup_interval) {
-        pcv_flow_expire_old(table, packet->timestamp_ns);
-        table->packet_counter = 0;
+
+    return NULL;
+}
+
+/* Insert a new flow keyed by its IPv4/IPv6 5-tuple. */
+static pcv_flow_stats* flow_table_insert_v6(pcv_flow_table* table,
+                                            const pcv_flow_key_v6* key) {
+    if (table->flow_count >= table->max_flows) {
+        return NULL;  /* Table full */
     }
-    
+
+    uint32_t hash = pcv_flow_hash_key_v6(key);
+    uint32_t start = hash % table->bucket_count;
+    uint32_t bucket = start;
+    uint32_t flow_idx = table->flow_count;
+
+    /* Find empty bucket using linear probing */
+    while (table->buckets[bucket] != UINT32_MAX) {
+        bucket = (bucket + 1) % table->bucket_count;
+        table->hash_collisions++;
+        if (bucket == start) {
+            return NULL;  /* No empty buckets */
+        }
+    }
+
+    /* Initialize new flow */
+    pcv_flow_stats* flow = &table->flows[flow_idx];
+    memset(flow, 0, sizeof(pcv_flow_stats));
+    flow->key6 = *key;
+    flow->hash = hash;
+    flow->flow_id = table->next_flow_id++;
+    flow->flow_state = PCV_FLOW_ACTIVE;
+
+    /* Insert into hash table */
+    table->buckets[bucket] = flow_idx;
+    table->flow_count++;
+    table->total_flows++;
+
+    return flow;
+}
+
+/* Look up flow by IPv4/IPv6 key */
+pcv_flow_stats* pcv_flow_lookup_v6(pcv_flow_table* table, const pcv_flow_key_v6* key) {
+    if (!table || !key) {
+        return NULL;
+    }
+    return flow_table_find_v6(table, key);
+}
+
+/* Update flow with new packet (IPv4/IPv6). Mirrors pcv_flow_update but tracks
+ * the full IPv4/IPv6 5-tuple, so IPv6 flows are aggregated too. */
+int pcv_flow_update_v6(pcv_flow_table* table, const pcv_packet* packet) {
+    pcv_flow_key_v6 key;
+    pcv_flow_stats* flow;
+
+    if (!table || !packet) {
+        return -1;
+    }
+
+    if (pcv_flow_extract_key_v6(packet, &key) < 0) {
+        return -1;
+    }
+
+    flow = flow_table_find_v6(table, &key);
+    if (!flow) {
+        flow = flow_table_insert_v6(table, &key);
+        if (!flow) {
+            return -1;  /* Failed to create flow */
+        }
+        flow->first_seen_ns = packet->timestamp_ns;
+    } else if (!(flow->flow_state & PCV_FLOW_ACTIVE)) {
+        /* The slot's previous flow for this 5-tuple was already evicted (and
+         * emitted). A packet arriving now is a NEW conversation that reuses the
+         * tuple, so restart the aggregate in place - otherwise its packets
+         * would accumulate onto a dead flow and never be emitted (a silent
+         * drop). The already-emitted row for the prior epoch stays; this epoch
+         * gets its own row at its next eviction / at shutdown. */
+        flow->first_seen_ns = packet->timestamp_ns;
+        flow->last_seen_ns  = packet->timestamp_ns;
+        flow->duration_ns   = 0;
+        flow->packet_count  = 0;
+        flow->byte_count    = 0;
+        flow->tcp_flags     = 0;
+        flow->flow_state    = PCV_FLOW_ACTIVE;
+    }
+
+    flow_record_packet(table, flow, packet, key.protocol);
+    return 0;
+}
+
+/* Register (or clear) the expiry hook. */
+int pcv_flow_table_set_expire_cb(pcv_flow_table* table,
+                                 void (*cb)(const pcv_flow_stats* flow, void* user),
+                                 void* user) {
+    if (!table) {
+        return -1;
+    }
+    table->on_expire = cb;
+    table->expire_ctx = user;
     return 0;
 }
 
@@ -283,6 +470,12 @@ int pcv_flow_expire_old(pcv_flow_table* table, uint64_t current_time_ns) {
                 flow->flow_state |= PCV_FLOW_TIMEOUT;
                 flow->flow_state &= ~PCV_FLOW_ACTIVE;
                 expired++;
+
+                /* Clearing PCV_FLOW_ACTIVE guards this block, so the hook runs
+                 * EXACTLY ONCE per flow over its lifetime - no double emit. */
+                if (table->on_expire) {
+                    table->on_expire(flow, table->expire_ctx);
+                }
             }
         }
     }

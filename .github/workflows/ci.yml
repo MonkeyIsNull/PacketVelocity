@@ -65,9 +65,11 @@ jobs:
 
   # Opt-in RistrettoDB V2 backend: REQUIRED job. The output layer has been
   # migrated to the RistrettoDB V2 append-only table API, so RISTRETTO=1 must
-  # build, link, and pass the offline sink round-trip test on both platforms.
+  # build, link, and pass the offline sink round-trip tests on both platforms -
+  # both the per-packet sink (test_ristretto) and the per-flow sink
+  # (test_ristretto_flow).
   ristretto-backend:
-    name: RISTRETTO=1 build + link + sink test (${{ matrix.os }})
+    name: RISTRETTO=1 build + link + sink tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -112,6 +114,11 @@ jobs:
           fi
           echo "OK: RISTRETTO=1 build links the RistrettoDB V2 API"
 
-      - name: Run offline tests incl. the RistrettoDB V2 sink round-trip
+      # `make RISTRETTO=1 test` builds and runs BOTH RistrettoDB V2 sink tests:
+      # the per-packet round-trip (test_ristretto) and the per-flow round-trip
+      # (test_ristretto_flow, which replays multiple packets across 3 flows -
+      # incl. IPv6 and expiry-vs-shutdown emission - and verifies the flows
+      # table read-back).
+      - name: Run offline tests incl. both RistrettoDB V2 sink round-trips
         working-directory: PacketVelocity
         run: make RISTRETTO=1 test

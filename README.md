@@ -114,8 +114,38 @@ text via `inet_ntop`, so full IPv6 / IPv4-mapped literals round-trip unchanged.
 | `length` | INTEGER | original on-wire packet length |
 | `caplen` | INTEGER | captured length (`<= length`) |
 
-If you pass `--output ristretto:...` to a binary built **without** `RISTRETTO=1`,
-it fails fast with a clear message rather than silently ignoring the flag.
+#### Per-flow output (`ristretto-flow:<path>`)
+
+As a parallel mode, `--output ristretto-flow:<path>` writes **one row per flow**
+(a 5-tuple conversation) to a `flows` table at `<path>.rdb`, instead of one row
+per packet. Packets are aggregated with PacketVelocity's own flow tracking; a
+row is emitted when a flow is evicted during capture (idle timeout or TCP FIN)
+and, at shutdown, for every flow still open - so each flow produces exactly one
+row, with nothing dropped or double-counted.
+
+```bash
+sudo ./packetvelocity -i en0 --output ristretto-flow:/var/log/pv/flows
+# -> creates /var/log/pv/flows.rdb, one row per 5-tuple conversation
+```
+
+The fixed schema (table `flows`) is IPv6-friendly the same way:
+
+| column | type | meaning |
+|--------|------|---------|
+| `src_ip` / `dst_ip` | TEXT(46) | addresses (`inet_ntop`, AF_INET/AF_INET6) |
+| `src_port` / `dst_port` | INTEGER | L4 ports (host order; 0 if none) |
+| `protocol` | INTEGER | IP protocol number (6=TCP, 17=UDP, ...) |
+| `addr_family` | INTEGER | 4 (IPv4) or 6 (IPv6) |
+| `first_ts_ns` / `last_ts_ns` | INTEGER | first / last packet timestamp (ns since epoch) |
+| `packet_count` | INTEGER | packets aggregated into this flow |
+| `byte_count` | INTEGER | sum of captured lengths over the flow |
+| `tcp_flags` | INTEGER | union (OR) of TCP flag bytes seen (0 for non-TCP) |
+
+Per-packet mode remains the default `ristretto:` behaviour and is unchanged.
+
+If you pass `--output ristretto:...` or `--output ristretto-flow:...` to a binary
+built **without** `RISTRETTO=1`, it fails fast with a clear message rather than
+silently ignoring the flag.
 
 ## Dependencies
 
@@ -182,6 +212,8 @@ sudo ./packetvelocity -i en0 -f myfilter.bin
 # Output sink: default is the tcpdump-style stdout stream ('-' / 'stdout').
 # With a RISTRETTO=1 build, append one row per packet to a RistrettoDB V2 table:
 sudo ./packetvelocity -i en0 -l "(= proto 6)" --output ristretto:/tmp/tcp_capture
+# ...or one row per flow (5-tuple conversation) instead of per packet:
+sudo ./packetvelocity -i en0 -l "(= proto 6)" --output ristretto-flow:/tmp/tcp_flows
 ```
 
 ## Performance Targets
