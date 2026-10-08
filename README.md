@@ -1,5 +1,15 @@
 # PacketVelocity
 
+[![CI](https://github.com/MonkeyIsNull/PacketVelocity/actions/workflows/ci.yml/badge.svg)](https://github.com/MonkeyIsNull/PacketVelocity/actions/workflows/ci.yml)
+![tests](https://img.shields.io/badge/tests-68%20passing-brightgreen)
+![language](https://img.shields.io/badge/language-C%20(C11)-blue)
+![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
+![status](https://img.shields.io/badge/status-active-brightgreen)
+[![last commit](https://img.shields.io/github/last-commit/MonkeyIsNull/PacketVelocity)](https://github.com/MonkeyIsNull/PacketVelocity/commits/main)
+[![contributions welcome](https://img.shields.io/badge/contributions-welcome-orange)](https://github.com/MonkeyIsNull/PacketVelocity/issues)
+![RistrettoDB optional](https://img.shields.io/badge/RistrettoDB-optional-blue)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 High-performance packet capture library with platform-specific optimizations.
 
 <img src="logo.jpg" alt="pvc_logo" width="85%" />
@@ -342,6 +352,10 @@ PacketVelocity now includes comprehensive IPv6 support through VelocityFilterMac
 - **Extension header support**: Dynamic offset calculation for transport fields
 - **High performance**: ARM64 JIT compilation for IPv6 operations
 - **Safety verified**: Enhanced verifier prevents IPv6-related crashes
+
+## Contributing
+
+Issues and pull requests are welcome. Found a bug or have an idea? Open an issue. Want to send a change? Fork, make it, and open a PR — please build and run the offline test suite first (`make && make test`, after building the `../VelocityFilterMachine` dependency with `make libvfm.a`). CI builds and runs the offline tests on macOS and Linux, including the opt-in `RISTRETTO=1` backend.
 
 ## License
 
