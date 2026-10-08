@@ -9,6 +9,14 @@ on:
 # Note: CI never runs live packet capture (that needs root and a real NIC).
 # It builds the default (hermetic, no-RistrettoDB) binary and runs the offline
 # test suite, which replays synthetic packets through the capture pipeline.
+#
+# The offline suite now also covers the `--serve` live dashboard, all without
+# root: test_dashboard (aggregation vs a known replay + rate/drop math),
+# test_http_guard (loopback-only bind + no-external-URL served HTML), and
+# test_dashboard_safety (hot-path source guard + a ThreadSanitizer leg that is
+# the substantive proof of the lock-free capture/serve isolation). All three run
+# under `make test` on BOTH macos-latest and ubuntu-latest, so the TSan
+# drop-safety build is exercised on both platforms, not just grep-guarded.
 
 jobs:
   build-and-test:
@@ -55,7 +63,7 @@ jobs:
           ./packetvelocity -V
           ./packetvelocity --help
 
-      - name: Run offline test suite (no root, no live capture)
+      - name: Run offline test suite (no root; incl. dashboard + TSan drop-safety)
         working-directory: PacketVelocity
         run: make test
 

@@ -20,10 +20,14 @@
 #include <getopt.h>
 #include <time.h>
 #include <errno.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include "pcv.h"
 #include "pcv_filter.h"
 #include "pcv_flow.h"
 #include "pcv_format.h"
+#include "pcv_dashboard.h"
+#include "pcv_http.h"
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <sys/socket.h>
@@ -54,11 +58,53 @@ typedef struct {
     uint32_t local_ip;
     char interface_name[32];
     bool has_ipv6;
+    pcv_dash_agg* dash;            /* non-NULL => --serve: route to the dashboard */
 #if HAVE_RISTRETTO
     pcv_output* output;            /* non-NULL => per-packet RistrettoDB sink */
     pcv_flow_output* flow_output;  /* non-NULL => per-flow RistrettoDB sink */
 #endif
 } callback_context;
+
+/* ---- Dashboard sampler thread (--serve) ---------------------------------
+ * The UI heartbeat: on a fixed ~1 Hz cadence driven by CLOCK_MONOTONIC (NOT by
+ * packet timestamps, so the capture-health panel keeps updating on a silent
+ * link), it reads the kernel's recv/drop counters (BIOCGSTATS, via the
+ * reentrant pcv_get_stats_r) and pushes one time-series Sample. It runs on its
+ * own thread; it never touches the flow table or any lock the capture thread
+ * can hold. */
+typedef struct {
+    pcv_handle*   handle;
+    pcv_dash_agg* agg;
+    _Atomic int   running;
+} sampler_ctx;
+
+static uint64_t monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void* sampler_thread(void* arg) {
+    sampler_ctx* s = (sampler_ctx*)arg;
+    while (atomic_load(&s->running)) {
+        /* Sleep ~1s in 100ms slices so shutdown (join) is prompt. */
+        for (int i = 0; i < 10 && atomic_load(&s->running); i++) {
+            struct timespec slice = { 0, 100 * 1000 * 1000 };
+            nanosleep(&slice, NULL);
+        }
+        if (!atomic_load(&s->running)) {
+            break;
+        }
+        pcv_stats st;
+        uint64_t recv = 0, dropped = 0;
+        if (pcv_get_stats_r(s->handle, &st) == 0) {
+            recv = st.packets_received;
+            dropped = st.packets_dropped;
+        }
+        pcv_dash_sample_with_stats(s->agg, recv, dropped, monotonic_ns());
+    }
+    return NULL;
+}
 
 /* Signal handler */
 static void signal_handler(int sig) {
@@ -158,6 +204,14 @@ static void packet_callback(const pcv_packet* packet, void* user_data) {
     }
 #endif
 
+    /* Dashboard mode (--serve): feed the hot-path-safe aggregator and SUPPRESS
+     * the per-packet stdout line (a deliberate, documented behavior change - the
+     * tcpdump stream and the dashboard are mutually exclusive). */
+    if (ctx && ctx->dash) {
+        pcv_dash_on_packet(ctx->dash, packet);
+        return;
+    }
+
     /* Format timestamp and packet info with direction */
     format_timestamp(packet->timestamp_ns, timestamp, sizeof(timestamp));
     uint32_t local_ip = ctx ? ctx->local_ip : 0;
@@ -188,6 +242,14 @@ static void print_usage(const char* program) {
     printf("                            'ristretto-flow:<path>' to write one row per flow\n");
     printf("                            (5-tuple conversation) to a 'flows' table at\n");
     printf("                            <path>.rdb (both require 'make RISTRETTO=1')\n");
+    printf("  -S, --serve <port>        Serve a LIVE DASHBOARD instead of the stdout\n");
+    printf("                            stream: a self-contained web page + JSON API on\n");
+    printf("                            http://127.0.0.1:<port> (use 0 to auto-pick a\n");
+    printf("                            port). The HTTP server binds LOOPBACK ONLY and is\n");
+    printf("                            never exposed on a LAN. Capture still needs root,\n");
+    printf("                            so run with sudo; the per-packet stdout stream is\n");
+    printf("                            suppressed in this mode. Cannot be combined with\n");
+    printf("                            --output ristretto*/ristretto-flow*.\n");
     printf("  -v, --verbose             Enable verbose output\n");
     printf("  -V, --version             Show version information\n");
     printf("  -h, --help                Show this help message\n");
@@ -243,6 +305,8 @@ int main(int argc, char* argv[]) {
     const char* filter_file = NULL;
     const char* lisp_expr = NULL;
     const char* output_spec = NULL;   /* NULL/'-'/'stdout' => tcpdump stream */
+    bool serve_enabled = false;       /* --serve => live dashboard mode */
+    long serve_port = -1;             /* 0 => auto-pick a loopback port */
     bool promiscuous = false;
     bool immediate = false;
     bool verbose = false;
@@ -264,6 +328,7 @@ int main(int argc, char* argv[]) {
         {"packet-num", required_argument, 0, 'c'},
         {"seconds-num", required_argument, 0, 't'},
         {"output", required_argument, 0, 'o'},
+        {"serve", required_argument, 0, 'S'},
         {"verbose", no_argument, 0, 'v'},
         {"version", no_argument, 0, 'V'},
         {"help", no_argument, 0, 'h'},
@@ -272,7 +337,7 @@ int main(int argc, char* argv[]) {
     
     /* Parse command line */
     int opt;
-    while ((opt = getopt_long(argc, argv, "i:f:l:pIb:c:t:o:vVh", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:f:l:pIb:c:t:o:S:vVh", long_options, NULL)) != -1) {
         switch (opt) {
         case 'i':
             interface = optarg;
@@ -301,6 +366,19 @@ int main(int argc, char* argv[]) {
         case 'o':
             output_spec = optarg;
             break;
+        case 'S': {
+            char* end = NULL;
+            errno = 0;
+            long p = strtol(optarg, &end, 10);
+            if (errno != 0 || end == optarg || *end != '\0' || p < 0 || p > 65535) {
+                fprintf(stderr, "Error: --serve requires a port in [0,65535] "
+                                "(0 = auto-pick)\n");
+                return 1;
+            }
+            serve_enabled = true;
+            serve_port = p;
+            break;
+        }
         case 'v':
             verbose = true;
             break;
@@ -370,6 +448,15 @@ int main(int argc, char* argv[]) {
                     output_spec);
             return 1;
         }
+    }
+
+    /* --serve is mutually exclusive with the RistrettoDB sinks: those consume
+     * packets via an early return before any flow feed, while the dashboard
+     * reads the flow table, so the two sinks would fight over the callback. */
+    if (serve_enabled && (ristretto_path || ristretto_flow_path)) {
+        fprintf(stderr, "Error: --serve cannot be combined with "
+                        "--output ristretto:/ristretto-flow:\n");
+        return 1;
     }
 
     /* Setup signal handling */
@@ -483,14 +570,103 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
+    /* --serve: stand up the live dashboard. Threads are created ONLY here, so
+     * without --serve no threads/sockets exist and the default stdout path is
+     * byte-for-byte unchanged. */
+    pcv_dash_agg* dash = NULL;
+    pcv_http_server http_srv;
+    sampler_ctx scx;
+    pthread_t http_tid = 0, sampler_tid = 0;
+    bool http_started = false, sampler_started = false;
+    if (serve_enabled) {
+        dash = pcv_dash_create(0, 0, 0);   /* modest serve flow config */
+        if (!dash) {
+            fprintf(stderr, "Error: Cannot create dashboard aggregator\n");
+            pcv_close(g_handle);
+            if (filter) pcv_filter_destroy(filter);
+            if (filter_bytecode) free(filter_bytecode);
+            return 1;
+        }
+
+        int listen_fd = -1;
+        char bound_ip[64] = {0};
+        uint16_t bound_port = 0;
+        if (pcv_http_listen_local((uint16_t)serve_port, &listen_fd,
+                                  bound_ip, sizeof(bound_ip), &bound_port) != 0) {
+            fprintf(stderr, "Error: Cannot bind dashboard HTTP server on "
+                            "127.0.0.1:%ld\n", serve_port);
+            pcv_dash_destroy(dash);
+            pcv_close(g_handle);
+            if (filter) pcv_filter_destroy(filter);
+            if (filter_bytecode) free(filter_bytecode);
+            return 1;
+        }
+
+        pcv_http_server_init(&http_srv, listen_fd, dash);
+        if (pthread_create(&http_tid, NULL, pcv_http_thread, &http_srv) != 0) {
+            fprintf(stderr, "Error: Cannot start HTTP thread\n");
+            pcv_http_stop(&http_srv);
+            pcv_dash_destroy(dash);
+            pcv_close(g_handle);
+            if (filter) pcv_filter_destroy(filter);
+            if (filter_bytecode) free(filter_bytecode);
+            return 1;
+        }
+        http_started = true;
+
+        scx.handle = g_handle;
+        scx.agg = dash;
+        atomic_store(&scx.running, 1);
+        if (pthread_create(&sampler_tid, NULL, sampler_thread, &scx) != 0) {
+            fprintf(stderr, "Error: Cannot start sampler thread\n");
+            atomic_store(&scx.running, 0);
+            pcv_http_stop(&http_srv);
+            pthread_join(http_tid, NULL);
+            pcv_dash_destroy(dash);
+            pcv_close(g_handle);
+            if (filter) pcv_filter_destroy(filter);
+            if (filter_bytecode) free(filter_bytecode);
+            return 1;
+        }
+        sampler_started = true;
+
+        ctx.dash = dash;
+        printf("Dashboard: http://%s:%u  (loopback only; capture needs sudo)\n",
+               bound_ip, bound_port);
+    }
+
     /* Initialize start time for time limit */
     g_start_time = time(NULL);
-    
+
     /* Start capture */
     int result = pcv_capture(g_handle, packet_callback, &ctx);
-    
+
+    /* --serve shutdown ordering (MANDATORY): stop + join BOTH dashboard threads
+     * BEFORE the end-of-run stats block and before destroying the aggregator.
+     * (a) pcv_get_stats aliases a function-static, so a live sampler calling it
+     *     concurrently with the stats print below would clobber the buffer -
+     *     joining the sampler first closes that; the print uses the reentrant
+     *     pcv_get_stats_r regardless.
+     * (b) Freeing the aggregator/flow table while the HTTP thread still reads it
+     *     is a use-after-free - joining the HTTP thread first closes that. */
+    if (serve_enabled) {
+        if (sampler_started) {
+            atomic_store(&scx.running, 0);
+        }
+        if (http_started) {
+            pcv_http_stop(&http_srv);
+        }
+        if (sampler_started) {
+            pthread_join(sampler_tid, NULL);
+        }
+        if (http_started) {
+            pthread_join(http_tid, NULL);
+        }
+    }
+
     /* Cleanup */
-    pcv_stats* stats = pcv_get_stats(g_handle);
+    pcv_stats stats_buf;
+    pcv_stats* stats = (pcv_get_stats_r(g_handle, &stats_buf) == 0) ? &stats_buf : NULL;
     if (stats) {
         printf("\nCapture Statistics:\n");
         printf("  Interface received: %" PRIu64 " (total packets seen by network interface)\n", stats->packets_received);
@@ -538,6 +714,12 @@ int main(int argc, char* argv[]) {
 #endif
 
     pcv_close(g_handle);
+
+    /* Both dashboard threads are joined above, so the aggregator has no more
+     * readers and is safe to free. */
+    if (dash) {
+        pcv_dash_destroy(dash);
+    }
 
     if (filter) {
         pcv_filter_destroy(filter);

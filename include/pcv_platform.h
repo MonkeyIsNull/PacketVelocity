@@ -104,6 +104,12 @@ typedef struct pcv_platform_ops {
 /* Platform initialization */
 const pcv_platform_ops* pcv_get_platform_ops(void);
 
+/* Reentrant stats: writes into the CALLER's buffer (no function-static), so the
+ * dashboard sampler thread and main() can read stats concurrently without
+ * clobbering a shared buffer (unlike pcv_get_stats, which aliases a static).
+ * Returns 0 on success, -1 on error. */
+int pcv_get_stats_r(pcv_handle* handle, pcv_stats* out);
+
 #ifdef __cplusplus
 }
 #endif

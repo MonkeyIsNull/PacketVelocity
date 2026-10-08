@@ -101,8 +101,18 @@ pcv_stats* pcv_get_stats(pcv_handle* handle) {
     if (ops->get_stats(handle, &stats) < 0) {
         return NULL;
     }
-    
+
     return &stats;
+}
+
+int pcv_get_stats_r(pcv_handle* handle, pcv_stats* out) {
+    const pcv_platform_ops* ops = pcv_get_platform_ops();
+
+    if (!ops || !ops->get_stats || !out) {
+        return -1;
+    }
+
+    return ops->get_stats(handle, out) < 0 ? -1 : 0;
 }
 
 const char* pcv_get_error(pcv_handle* handle) {
