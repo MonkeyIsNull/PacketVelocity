@@ -27,6 +27,7 @@
 #include "pcv_flow.h"
 #include "pcv_format.h"
 #include "pcv_dashboard.h"
+#include "pcv_resolve.h"
 #include "pcv_http.h"
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -574,10 +575,11 @@ int main(int argc, char* argv[]) {
      * without --serve no threads/sockets exist and the default stdout path is
      * byte-for-byte unchanged. */
     pcv_dash_agg* dash = NULL;
+    pcv_resolver* resolver = NULL;
     pcv_http_server http_srv;
     sampler_ctx scx;
-    pthread_t http_tid = 0, sampler_tid = 0;
-    bool http_started = false, sampler_started = false;
+    pthread_t http_tid = 0, sampler_tid = 0, resolver_tid = 0;
+    bool http_started = false, sampler_started = false, resolver_started = false;
     if (serve_enabled) {
         dash = pcv_dash_create(0, 0, 0);   /* modest serve flow config */
         if (!dash) {
@@ -630,8 +632,33 @@ int main(int argc, char* argv[]) {
         }
         sampler_started = true;
 
+        /* Names engine: passive-DNS + bounded reverse-PTR. Best-effort - if it
+         * cannot be created the dashboard still runs with raw IPs. Wire it
+         * BEFORE capture starts so the hot path begins feeding the ring, and
+         * before the local IP so the `you` badge resolves. */
+        resolver = pcv_resolver_create(dash, NULL, NULL);
+        if (resolver) {
+            pcv_dash_set_resolver(dash, resolver);
+            pcv_dash_set_local_ip(dash, local_ip);
+            if (pthread_create(&resolver_tid, NULL, pcv_resolver_thread,
+                               resolver) != 0) {
+                /* Could not start the thread: unwire and tear the resolver down
+                 * so the hot path stops enqueuing and no map is leaked. */
+                fprintf(stderr, "Warning: Cannot start resolver thread; "
+                                "continuing without name resolution\n");
+                pcv_dash_set_resolver(dash, NULL);
+                pcv_resolver_destroy(resolver);
+                resolver = NULL;
+            } else {
+                resolver_started = true;
+            }
+        } else {
+            fprintf(stderr, "Warning: Cannot create resolver; continuing "
+                            "without name resolution\n");
+        }
+
         ctx.dash = dash;
-        printf("Dashboard: http://%s:%u  (loopback only; capture needs sudo)\n",
+        printf("Dashboard: http://%s:%u  (loopback only)\n",
                bound_ip, bound_port);
     }
 
@@ -650,14 +677,27 @@ int main(int argc, char* argv[]) {
      * (b) Freeing the aggregator/flow table while the HTTP thread still reads it
      *     is a use-after-free - joining the HTTP thread first closes that. */
     if (serve_enabled) {
+        /* Capture has already returned, so there are NO more ring writers. Clear
+         * every thread's running flag, break the HTTP accept/send, then JOIN all
+         * three. BOTH the HTTP thread and the resolver thread read the names map,
+         * so BOTH must be joined before pcv_resolver_destroy below (mirrors the
+         * existing join-HTTP-before-free invariant). A wedged reverse-PTR lookup
+         * can delay the resolver join by at most one in-flight lookup (K=8/cycle
+         * + running re-checked between every lookup); capture is unaffected. */
         if (sampler_started) {
             atomic_store(&scx.running, 0);
+        }
+        if (resolver_started) {
+            pcv_resolver_stop(resolver);
         }
         if (http_started) {
             pcv_http_stop(&http_srv);
         }
         if (sampler_started) {
             pthread_join(sampler_tid, NULL);
+        }
+        if (resolver_started) {
+            pthread_join(resolver_tid, NULL);
         }
         if (http_started) {
             pthread_join(http_tid, NULL);
@@ -715,8 +755,14 @@ int main(int argc, char* argv[]) {
 
     pcv_close(g_handle);
 
-    /* Both dashboard threads are joined above, so the aggregator has no more
-     * readers and is safe to free. */
+    /* All dashboard threads are joined above, so the map/aggregator have no more
+     * readers. SINGLE free ownership: pcv_resolver_destroy frees the map + PTR
+     * caches; pcv_dash_destroy frees the aggregator + its inline ring. The
+     * resolver is unwired and freed BEFORE the aggregator it points into. */
+    if (resolver) {
+        pcv_dash_set_resolver(dash, NULL);
+        pcv_resolver_destroy(resolver);
+    }
     if (dash) {
         pcv_dash_destroy(dash);
     }

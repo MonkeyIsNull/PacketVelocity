@@ -28,7 +28,9 @@
 #include <pthread.h>
 
 #include "pcv_platform.h"
+#include "pcv_flow.h"
 #include "pcv_dashboard.h"
+#include "pcv_resolve.h"
 #include "pcv_test.h"
 
 /* ---- (a) structural source guard ---------------------------------------- */
@@ -81,6 +83,7 @@ static void test_source_guard(const char* path) {
         "malloc(", "calloc(", "realloc(", "free(",
         "socket(", "pcv_get_stats",
         "pthread_mutex_lock(",   /* BLOCKING lock; trylock is allowed */
+        "getnameinfo(", "getaddrinfo(",  /* blocking resolver: resolver thread only */
     };
     for (size_t i = 0; i < sizeof(banned)/sizeof(banned[0]); i++) {
         char msg[96];
@@ -161,9 +164,99 @@ static void test_tsan_stress(void) {
     pcv_dash_destroy(g_agg);
 }
 
+/* ---- (c) ThreadSanitizer: capture ring enqueue vs resolver drain vs lookup -
+ * One thread enqueues DNS/mDNS + flow packets via pcv_dash_on_packet (writing
+ * the SPSC ring with wait-free atomics); the resolver thread drains+parses the
+ * ring and inserts to the map; a third thread does pcv_resolve_lookup +
+ * snapshot_json. Any race on the ring release/acquire or names_mtx copy-out
+ * flips TSan's exit code. The PTR seam is a no-op STUB (never live DNS). */
+
+static pcv_resolver* gr_resolver;
+static pcv_dash_agg* gr_agg;
+static _Atomic int gr_writer_done;
+static uint8_t gr_dns[512];
+static uint32_t gr_dnslen;
+static uint8_t gr_flow[128];
+static uint32_t gr_flowlen;
+
+static int gr_stub(const pcv_resolve_key* k, char* out, size_t n, void* c) {
+    (void)k; (void)c;
+    strncpy(out, "stub.example", n - 1);
+    out[n - 1] = '\0';
+    return 0;
+}
+
+static void* gr_writer(void* arg) {
+    (void)arg;
+    const uint64_t base = 1000000000ULL;
+    for (int i = 0; i < 100000; i++) {
+        pcv_packet p;
+        memset(&p, 0, sizeof(p));
+        p.timestamp_ns = base + (uint64_t)i * 1000000ULL;
+        if (i & 1) { p.data = gr_dns;  p.captured_length = gr_dnslen;  p.length = gr_dnslen; }
+        else       { p.data = gr_flow; p.captured_length = gr_flowlen; p.length = gr_flowlen; }
+        pcv_dash_on_packet(gr_agg, &p);
+        if ((i % 1000) == 0) pcv_dash_force_snapshot(gr_agg);
+    }
+    atomic_store(&gr_writer_done, 1);
+    return NULL;
+}
+
+static void* gr_reader(void* arg) {
+    (void)arg;
+    static char buf[65536];
+    while (!atomic_load(&gr_writer_done)) {
+        pcv_dash_snapshot_json(gr_agg, buf, sizeof(buf));
+        pcv_resolve_key k;
+        uint8_t nb[4] = {8, 8, 8, 8};
+        pcv_resolve_key_make(PCV_ADDR_IPV4, nb, &k);
+        char nm[256];
+        pcv_resolve_lookup(gr_resolver, &k, nm, sizeof(nm));
+    }
+    return NULL;
+}
+
+static void test_tsan_resolver(void) {
+    fprintf(stdout, "ThreadSanitizer stress (ring enqueue vs resolver drain vs lookup)\n");
+    gr_agg = pcv_dash_create(0, 0, 0);
+    CHECK(gr_agg != NULL, "create agg for resolver TSan stress");
+    if (!gr_agg) return;
+    gr_resolver = pcv_resolver_create(gr_agg, gr_stub, NULL);
+    CHECK(gr_resolver != NULL, "create resolver for TSan stress");
+    if (!gr_resolver) { pcv_dash_destroy(gr_agg); return; }
+    pcv_dash_set_resolver(gr_agg, gr_resolver);
+
+    uint8_t a1[4] = {8, 8, 8, 8};
+    pcv_dns_answer an = { 1, 0, a1 };
+    gr_dnslen = (uint32_t)pcv_build_dns_ipv4(gr_dns, sizeof(gr_dns),
+                                             0x08080808u, 0x0A000001u, 53, 33333,
+                                             "example.com", 1, 1, 0, 1, &an, 1);
+    CHECK(gr_dnslen > 0, "build DNS :53 stress frame");
+    gr_flowlen = (uint32_t)pcv_build_ipv4_frame(gr_flow, sizeof(gr_flow), 6,
+                                                0x0A000001u, 0x08080808u,
+                                                1234, 443, 0x10, 20);
+    CHECK(gr_flowlen > 0, "build flow stress frame");
+    atomic_store(&gr_writer_done, 0);
+
+    pthread_t rt, wt, res;
+    pthread_create(&res, NULL, pcv_resolver_thread, gr_resolver);
+    pthread_create(&rt, NULL, gr_reader, NULL);
+    pthread_create(&wt, NULL, gr_writer, NULL);
+    pthread_join(wt, NULL);
+    pthread_join(rt, NULL);
+    pcv_resolver_stop(gr_resolver);
+    pthread_join(res, NULL);
+
+    CHECK(1, "no data race across ring enqueue / drain / lookup (TSan)");
+    pcv_dash_set_resolver(gr_agg, NULL);
+    pcv_resolver_destroy(gr_resolver);
+    pcv_dash_destroy(gr_agg);
+}
+
 int main(int argc, char** argv) {
     const char* src = (argc > 1) ? argv[1] : "src/pcv_dash_hot.c";
     test_source_guard(src);
     test_tsan_stress();
+    test_tsan_resolver();
     return pcv_test_summary("test_dashboard_safety");
 }

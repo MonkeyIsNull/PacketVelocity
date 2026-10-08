@@ -19,6 +19,7 @@
  */
 
 #include "pcv_dashboard_internal.h"
+#include "pcv_flow.h"
 
 #include <string.h>
 
@@ -124,6 +125,7 @@ void pcv_dash_build_topn(struct pcv_dash_agg* agg) {
             dst->packet_count = f->packet_count;
             dst->byte_count   = f->byte_count;
             dst->duration_ns  = f->duration_ns;
+            dst->last_seen_ns = f->last_seen_ns;
             dst->tcp_flags    = f->tcp_flags;
             if (n < topn) {
                 s->count = n + 1;
@@ -140,6 +142,35 @@ static void dash_try_publish(struct pcv_dash_agg* agg) {
         agg->published = agg->scratch;         /* fixed-size struct copy */
         pthread_mutex_unlock(&agg->mtx);
     }
+}
+
+/* ---- Passive-DNS enqueue (capture thread) -------------------------------
+ * Copy a bounded UDP payload into the next SPSC ring slot with WAIT-FREE
+ * atomics ONLY: no lock, no malloc, no syscall, no I/O. SINGLE-PRODUCER (the
+ * capture thread). A full ring simply drops the copy and bumps dns_dropped -
+ * names are best-effort and never allowed to stall capture. */
+static void dns_ring_enqueue(struct pcv_dash_agg* agg, const uint8_t* payload,
+                             uint32_t copy_len) {
+    if (copy_len == 0) {
+        return;
+    }
+    if (copy_len > PCV_DNS_SLOT_BYTES) {
+        copy_len = PCV_DNS_SLOT_BYTES;            /* parser bounds by slot len */
+    }
+    /* Producer owns tail (relaxed self-read); acquire-load head to see the
+     * consumer's latest drain so "full" is accurate. */
+    uint32_t tail = atomic_load_explicit(&agg->dns_tail, memory_order_relaxed);
+    uint32_t head = atomic_load_explicit(&agg->dns_head, memory_order_acquire);
+    uint32_t next = (tail + 1u) & PCV_DNS_RING_MASK;
+    if (next == head) {
+        atomic_fetch_add_explicit(&agg->dns_dropped, 1u, memory_order_relaxed);
+        return;                                   /* ring full: drop, never block */
+    }
+    pcv_dns_slot* slot = &agg->dns_ring[tail];
+    memcpy(slot->bytes, payload, copy_len);
+    slot->len = copy_len;
+    /* Release so the slot bytes + len are visible to the consumer's acquire. */
+    atomic_store_explicit(&agg->dns_tail, next, memory_order_release);
 }
 
 /* THE per-packet hot hook. */
@@ -160,6 +191,38 @@ void pcv_dash_on_packet(pcv_dash_agg* agg, const pcv_packet* packet) {
 
     /* 3. Feed the existing flow tracker (capture owns the table). */
     pcv_flow_update_v6(agg->flows, packet);
+
+    /* 3b. PASSIVE-DNS enqueue (only when --serve wired a resolver). A non-DNS
+     *     packet pays ONE extra branch (the family gate). dash_classify folds
+     *     ALL IPv6 into PCV_PROTO_IPV6 and never resolves L4, so we must enter
+     *     on k==UDP (IPv4 UDP) OR k==IPV6 (any IPv6, incl. the mDNS ff02::fb
+     *     traffic that is IPv6 on macOS), then confirm UDP via the shared,
+     *     bounds-checked offset walk. All parsing happens OFF this thread. */
+    if (agg->resolver != NULL &&
+        (k == PCV_PROTO_UDP || k == PCV_PROTO_IPV6)) {
+        uint32_t l4_off = 0;
+        uint8_t  l4_proto = 0;
+        if (pcv_l4_header_offset(packet, &l4_off, &l4_proto) && l4_proto == 17) {
+            uint32_t caplen = packet->captured_length;
+            /* Underflow-SAFE: never form (caplen - 8); add on the l4_off side.
+             * pcv_l4_header_offset only guarantees l4_off <= caplen, so the UDP
+             * header (8 bytes) must be re-checked here before any read. */
+            if ((uint64_t)l4_off + 8u <= (uint64_t)caplen) {
+                const uint8_t* u = packet->data + l4_off;
+                uint16_t sport = (uint16_t)((u[0] << 8) | u[1]);
+                uint16_t dport = (uint16_t)((u[2] << 8) | u[3]);
+                /* Candidate RESPONSE: classic resolver reply (UDP src 53) OR
+                 * mDNS (5353 either direction). */
+                if (sport == 53u || sport == 5353u || dport == 5353u) {
+                    uint32_t payload_off = l4_off + 8u;
+                    uint32_t avail = caplen - payload_off;    /* safe: >= 0 */
+                    uint32_t copy_len = (avail < PCV_DNS_SLOT_BYTES)
+                                      ? avail : PCV_DNS_SLOT_BYTES;
+                    dns_ring_enqueue(agg, packet->data + payload_off, copy_len);
+                }
+            }
+        }
+    }
 
     /* 4. Time-gated self-snapshot: ONE 64-bit integer compare per packet. The
      *    build + publish run at most ~1/sec, piggybacking the periodic slot the

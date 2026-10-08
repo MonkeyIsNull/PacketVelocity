@@ -177,6 +177,17 @@ int pcv_flow_key_compare(const pcv_flow_key* a, const pcv_flow_key* b);
 void pcv_flow_key_v6_to_string(const pcv_flow_key_v6* key, char* buffer, size_t size);
 int pcv_flow_key_v6_compare(const pcv_flow_key_v6* a, const pcv_flow_key_v6* b);
 
+/* Render a SINGLE endpoint address (no port/brackets) into buf. */
+void pcv_flow_addr_to_string(uint8_t addr_family, const pcv_ip_addr_t* addr,
+                             char* buf, size_t size);
+
+/* L4-header byte offset (from the Ethernet frame start) + resolved L4 protocol,
+ * fully bounds-checked against the CAPTURED length (returns false rather than an
+ * out-of-range offset). Promoted from the flow TU for the hot-path passive-DNS
+ * enqueue; callers still re-check that their specific L4 fields fit. */
+bool pcv_l4_header_offset(const pcv_packet* packet, uint32_t* out_off,
+                          uint8_t* out_proto);
+
 /* Flow iteration for bulk operations */
 typedef void (*pcv_flow_iterator)(const pcv_flow_stats* flow, void* user_data);
 int pcv_flow_iterate(pcv_flow_table* table, pcv_flow_iterator callback, void* user_data);

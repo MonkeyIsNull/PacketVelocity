@@ -213,15 +213,24 @@ pcv_flow_stats* pcv_flow_lookup(pcv_flow_table* table, const pcv_flow_key* key) 
 }
 
 /* Byte offset (from the start of the Ethernet frame) of the L4 header, and the
- * resolved L4 protocol. Returns false if the frame is too short or not IPv4/
- * IPv6. Mirrors the offset walk in pcv_flow_extract_key_v6 (including IPv6
- * extension headers) so TCP flags are read from the right place for both
- * address families, not just IPv4. */
-static bool l4_header_offset(const pcv_packet* packet, uint32_t* out_off,
-                             uint8_t* out_proto) {
+ * resolved L4 protocol. Returns false if the frame is too short, not IPv4/IPv6,
+ * or if the computed offset would land past the CAPTURED bytes. Mirrors the
+ * offset walk in pcv_flow_extract_key_v6 (including IPv6 extension headers) so
+ * TCP flags - and the passive-DNS UDP payload - are read from the right place
+ * for both address families, not just IPv4.
+ *
+ * HARDENED (promoted for the hot-path DNS enqueue): the IPv4 IHL can reach 60,
+ * so out_off is explicitly bounded `<= len`; the IPv6 extension walk uses a
+ * single FRAME-RELATIVE bound (14 + off ...) throughout; and the function
+ * returns false - rather than an out-of-range offset - when the header does not
+ * fit in the captured bytes. Callers still re-check that the specific L4 fields
+ * they read (TCP flags, UDP ports/payload) fit, since this only guarantees the
+ * L4 HEADER START is within len. */
+bool pcv_l4_header_offset(const pcv_packet* packet, uint32_t* out_off,
+                          uint8_t* out_proto) {
     const uint8_t* data = packet->data;
     uint32_t len = packet->captured_length;
-    if (len < 34) {
+    if (data == NULL || len < 34) {
         return false;
     }
 
@@ -229,30 +238,40 @@ static bool l4_header_offset(const pcv_packet* packet, uint32_t* out_off,
     uint8_t version = (ip[0] >> 4) & 0x0F;
 
     if (version == 4) {
-        uint8_t ihl = (ip[0] & 0x0F) * 4;
+        uint8_t ihl = (uint8_t)((ip[0] & 0x0F) * 4);
+        if (ihl < 20) {
+            return false;               /* malformed IHL (< minimum IPv4 hdr) */
+        }
+        uint32_t off = 14u + (uint32_t)ihl;
+        if (off > len) {
+            return false;               /* header runs past captured bytes */
+        }
         *out_proto = ip[9];
-        *out_off = 14 + ihl;
+        *out_off = off;
         return true;
     } else if (version == 6) {
         if (len < 54) {
             return false;
         }
         uint8_t next = ip[6];
-        uint16_t off = 40;  /* fixed IPv6 header */
-        while (is_ipv6_extension_header(next) && (uint32_t)(14 + off) < len) {
-            if ((uint32_t)(14 + off + 2) > len) {
-                break;
-            }
+        uint32_t off = 40;  /* fixed IPv6 header, relative to the IPv6 header */
+        /* All bounds are FRAME-RELATIVE (14 + off ...) and consistent. */
+        while (is_ipv6_extension_header(next) &&
+               (uint64_t)14u + off + 2u <= (uint64_t)len) {
             const uint8_t* eh = ip + off;
             uint16_t elen = get_ipv6_extension_header_length(next, eh);
-            if (elen == 0 || (off + elen) > len) {
+            if (elen == 0 || (uint64_t)14u + off + elen > (uint64_t)len) {
                 break;
             }
             next = eh[0];
             off += elen;
         }
+        uint32_t abs_off = 14u + off;
+        if (abs_off > len) {
+            return false;
+        }
         *out_proto = next;
-        *out_off = 14 + off;
+        *out_off = abs_off;
         return true;
     }
 
@@ -276,7 +295,7 @@ static void flow_record_packet(pcv_flow_table* table, pcv_flow_stats* flow,
     if (protocol == 6) {  /* TCP */
         uint32_t l4_off = 0;
         uint8_t l4_proto = 0;
-        if (l4_header_offset(packet, &l4_off, &l4_proto) && l4_proto == 6 &&
+        if (pcv_l4_header_offset(packet, &l4_off, &l4_proto) && l4_proto == 6 &&
             packet->captured_length >= (uint32_t)(l4_off + 14)) {
             uint8_t tcp_flags = packet->data[l4_off + 13];
             flow->tcp_flags |= tcp_flags;
@@ -828,6 +847,28 @@ void pcv_flow_key_v6_to_string(const pcv_flow_key_v6* key, char* buffer, size_t 
                  key->protocol);
     } else {
         snprintf(buffer, size, "unknown address family");
+    }
+}
+
+/* Render a SINGLE endpoint address to a string (no port, no brackets), so the
+ * dashboard serializer can emit discrete src_ip/dst_ip fields instead of
+ * string-splitting the bracketed 5-tuple. addr_family is PCV_ADDR_IPV4 or
+ * PCV_ADDR_IPV6; addr is the matching union member (network byte order). */
+void pcv_flow_addr_to_string(uint8_t addr_family, const pcv_ip_addr_t* addr,
+                             char* buf, size_t size) {
+    if (!buf || size == 0) {
+        return;
+    }
+    if (addr_family == PCV_ADDR_IPV4) {
+        if (!inet_ntop(AF_INET, &addr->ipv4, buf, (socklen_t)size)) {
+            buf[0] = '\0';
+        }
+    } else if (addr_family == PCV_ADDR_IPV6) {
+        if (!inet_ntop(AF_INET6, addr->ipv6, buf, (socklen_t)size)) {
+            buf[0] = '\0';
+        }
+    } else {
+        buf[0] = '\0';
     }
 }
 

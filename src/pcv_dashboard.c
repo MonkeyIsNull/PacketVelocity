@@ -21,11 +21,18 @@
 #endif
 
 #include "pcv_dashboard_internal.h"
+#include "pcv_resolve.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <arpa/inet.h>
+
+/* Request-local name buffer: a sanitized name is capped at 255 bytes; the
+ * allowlist can never produce a '"' or '\\', so json_escape copies 1:1 and this
+ * headroom is never exceeded. */
+#define PCV_NAME_MAX_JSON 272u
 
 /* ---- Create / destroy ---------------------------------------------------- */
 
@@ -72,6 +79,18 @@ void pcv_dash_destroy(pcv_dash_agg* agg) {
     }
     pthread_mutex_destroy(&agg->mtx);
     free(agg);
+}
+
+void pcv_dash_set_resolver(pcv_dash_agg* agg, struct pcv_resolver* resolver) {
+    if (agg) {
+        agg->resolver = resolver;
+    }
+}
+
+void pcv_dash_set_local_ip(pcv_dash_agg* agg, uint32_t local_ip_host_order) {
+    if (agg) {
+        agg->local_ip = local_ip_host_order;
+    }
 }
 
 /* ---- Test / shutdown seam: deterministic snapshot ------------------------
@@ -266,24 +285,169 @@ size_t pcv_dash_snapshot_json(pcv_dash_agg* agg, char* buf, size_t size) {
     }
     EMIT("],");
 
-    /* Top-N live flows ([] never null). */
-    EMIT("\"flows\":[");
+    /* Top-N live flows ([] never null). Each row carries the legacy `tuple`
+     * AND discrete src/dst ip+port fields (robust vs. bracketed-IPv6 string
+     * splitting), plus sanitized src_name/dst_name looked up AFTER the agg->mtx
+     * release above (pcv_resolve_lookup takes its OWN names_mtx - no nesting). */
     uint32_t fcount = flows_local.count;
     if (fcount > agg->topn) {
         fcount = agg->topn;
     }
+
+    /* now_ns = the most recent last_seen across the published rows, so the
+     * client ages hosts against the SAME packet-timestamp clock (skew-free). */
+    uint64_t now_ns = 0;
+    for (uint32_t i = 0; i < fcount; i++) {
+        if (flows_local.rows[i].last_seen_ns > now_ns) {
+            now_ns = flows_local.rows[i].last_seen_ns;
+        }
+    }
+
+    EMIT("\"flows\":[");
     for (uint32_t i = 0; i < fcount; i++) {
         const pcv_dash_flow_row* r = &flows_local.rows[i];
         char tuple[128];
         char esc[160];
+        char sip[INET6_ADDRSTRLEN], dip[INET6_ADDRSTRLEN];
+        char sname[PCV_NAME_MAX_JSON], dname[PCV_NAME_MAX_JSON];
+        char sname_e[PCV_NAME_MAX_JSON], dname_e[PCV_NAME_MAX_JSON];
+
         pcv_flow_key_v6_to_string(&r->key, tuple, sizeof(tuple));
         json_escape(tuple, esc, sizeof(esc));
-        EMIT("%s{\"tuple\":\"%s\",\"packets\":%" PRIu64 ",\"bytes\":%" PRIu64
-             ",\"tcp_flags\":%u,\"duration_ms\":%.3f}",
-             (i == 0) ? "" : ",", esc, r->packet_count, r->byte_count,
-             (unsigned)r->tcp_flags, (double)r->duration_ns / 1e6);
+        pcv_flow_addr_to_string(r->key.addr_family, &r->key.src_ip, sip, sizeof(sip));
+        pcv_flow_addr_to_string(r->key.addr_family, &r->key.dst_ip, dip, sizeof(dip));
+
+        sname[0] = dname[0] = '\0';
+        if (agg->resolver) {
+            pcv_resolve_key ks, kd;
+            if (r->key.addr_family == PCV_ADDR_IPV4) {
+                pcv_resolve_key_make(PCV_ADDR_IPV4, &r->key.src_ip.ipv4, &ks);
+                pcv_resolve_key_make(PCV_ADDR_IPV4, &r->key.dst_ip.ipv4, &kd);
+            } else {
+                pcv_resolve_key_make(PCV_ADDR_IPV6, r->key.src_ip.ipv6, &ks);
+                pcv_resolve_key_make(PCV_ADDR_IPV6, r->key.dst_ip.ipv6, &kd);
+            }
+            pcv_resolve_lookup(agg->resolver, &ks, sname, sizeof(sname));
+            pcv_resolve_lookup(agg->resolver, &kd, dname, sizeof(dname));
+        }
+        json_escape(sname, sname_e, sizeof(sname_e));
+        json_escape(dname, dname_e, sizeof(dname_e));
+
+        EMIT("%s{\"tuple\":\"%s\",\"src_ip\":\"%s\",\"src_port\":%u,"
+             "\"dst_ip\":\"%s\",\"dst_port\":%u,"
+             "\"src_name\":\"%s\",\"dst_name\":\"%s\","
+             "\"packets\":%" PRIu64 ",\"bytes\":%" PRIu64
+             ",\"tcp_flags\":%u,\"duration_ms\":%.3f,\"last_seen\":%" PRIu64 "}",
+             (i == 0) ? "" : ",", esc, sip, (unsigned)r->key.src_port,
+             dip, (unsigned)r->key.dst_port, sname_e, dname_e,
+             r->packet_count, r->byte_count,
+             (unsigned)r->tcp_flags, (double)r->duration_ns / 1e6,
+             r->last_seen_ns);
     }
-    EMIT("]}");
+    EMIT("],");
+
+    /* Hosts panel: a per-ENDPOINT reduction of the SAME published top-N snapshot
+     * (both endpoints of each flow contribute), top-N by bytes, name-decorated.
+     * A bounded approximation (misses hosts spread across sub-top-N flows) -
+     * flagged for the follow-up full per-IP table. */
+    EMIT("\"hosts\":[");
+    {
+        typedef struct {
+            uint8_t used, family;
+            union { uint32_t v4; uint8_t v6[16]; } a;
+            uint64_t pkts, bytes, last_seen;
+        } host_acc;
+        static _Thread_local host_acc hosts[PCV_DASH_TOPN * 2u];
+        uint32_t hn = 0;
+
+        for (uint32_t i = 0; i < fcount; i++) {
+            const pcv_dash_flow_row* r = &flows_local.rows[i];
+            uint8_t fam = r->key.addr_family;
+            for (int side = 0; side < 2; side++) {
+                const void* addr = (side == 0)
+                    ? ((fam == PCV_ADDR_IPV4) ? (const void*)&r->key.src_ip.ipv4
+                                              : (const void*)r->key.src_ip.ipv6)
+                    : ((fam == PCV_ADDR_IPV4) ? (const void*)&r->key.dst_ip.ipv4
+                                              : (const void*)r->key.dst_ip.ipv6);
+                size_t alen = (fam == PCV_ADDR_IPV4) ? 4u : 16u;
+
+                uint32_t j = 0;
+                for (; j < hn; j++) {
+                    if (hosts[j].family == fam &&
+                        memcmp(&hosts[j].a, addr, alen) == 0) {
+                        break;
+                    }
+                }
+                if (j == hn) {
+                    if (hn >= PCV_DASH_TOPN * 2u) {
+                        continue;              /* bounded; never grows */
+                    }
+                    memset(&hosts[hn], 0, sizeof(hosts[hn]));
+                    hosts[hn].used = 1;
+                    hosts[hn].family = fam;
+                    memcpy(&hosts[hn].a, addr, alen);
+                    j = hn++;
+                }
+                hosts[j].pkts += r->packet_count;
+                hosts[j].bytes += r->byte_count;
+                if (r->last_seen_ns > hosts[j].last_seen) {
+                    hosts[j].last_seen = r->last_seen_ns;
+                }
+            }
+        }
+
+        /* Selection sort the top (<= agg->topn) by bytes desc - small N. */
+        uint32_t want = (hn < agg->topn) ? hn : agg->topn;
+        for (uint32_t s = 0; s < want; s++) {
+            uint32_t best = s;
+            for (uint32_t t = s + 1; t < hn; t++) {
+                if (hosts[t].bytes > hosts[best].bytes) {
+                    best = t;
+                }
+            }
+            if (best != s) {
+                host_acc tmp = hosts[s];
+                hosts[s] = hosts[best];
+                hosts[best] = tmp;
+            }
+
+            const host_acc* h = &hosts[s];
+            char ip[INET6_ADDRSTRLEN];
+            char hname[PCV_NAME_MAX_JSON], hname_e[PCV_NAME_MAX_JSON];
+            pcv_ip_addr_t ipu;
+            memset(&ipu, 0, sizeof(ipu));
+            memcpy(&ipu, &h->a, (h->family == PCV_ADDR_IPV4) ? 4u : 16u);
+            pcv_flow_addr_to_string(h->family, &ipu, ip, sizeof(ip));
+
+            hname[0] = '\0';
+            if (agg->resolver) {
+                pcv_resolve_key hk;
+                pcv_resolve_key_make(h->family, &h->a, &hk);
+                pcv_resolve_lookup(agg->resolver, &hk, hname, sizeof(hname));
+            }
+            json_escape(hname, hname_e, sizeof(hname_e));
+
+            EMIT("%s{\"ip\":\"%s\",\"name\":\"%s\",\"pkts\":%" PRIu64
+                 ",\"bytes\":%" PRIu64 ",\"last_seen\":%" PRIu64 "}",
+                 (s == 0) ? "" : ",", ip, hname_e, h->pkts, h->bytes,
+                 h->last_seen);
+        }
+    }
+    EMIT("],");
+
+    /* Local-host IPv4 (the `you` badge). get_interface_ip returns HOST order,
+     * so htonl() before inet_ntop or the little-endian address byte-reverses. */
+    {
+        char lip[INET_ADDRSTRLEN];
+        lip[0] = '\0';
+        if (agg->local_ip != 0) {
+            uint32_t net = htonl(agg->local_ip);
+            inet_ntop(AF_INET, &net, lip, sizeof(lip));
+        }
+        EMIT("\"local\":\"%s\",", lip);
+    }
+
+    EMIT("\"now_ns\":%" PRIu64 "}", now_ns);
 
 #undef EMIT
 done:

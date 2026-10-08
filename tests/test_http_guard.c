@@ -269,6 +269,7 @@ static void test_html_positive(void) {
     const char* required[] = {
         "<!doctype", "charset",
         "panel-capture", "panel-proto", "panel-flows",
+        "panel-hosts", "hosts-body",
         "drop-rate",
         "fetch('/stats.json'",
         "textContent",

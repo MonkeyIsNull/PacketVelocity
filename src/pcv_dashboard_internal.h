@@ -22,6 +22,20 @@
 /* Snapshot cadence on the capture thread (nanoseconds), gated by packet->timestamp_ns. */
 #define PCV_DASH_SNAP_INTERVAL_NS 1000000000ULL
 
+/* ---- Passive-DNS SPSC ring (capture -> resolver) ------------------------
+ * The capture hot path copies each DNS/mDNS UDP payload into the next ring slot
+ * with WAIT-FREE atomics only (no lock, no malloc, no syscall). The resolver
+ * thread drains + parses. Single-producer (capture) / single-consumer
+ * (resolver). PCV_DNS_RING_SLOTS MUST be a power of two (index mask). */
+#define PCV_DNS_SLOT_BYTES 1536u    /* >= a DNS-over-UDP payload (EDNS ~1232) */
+#define PCV_DNS_RING_SLOTS 64u      /* power of two; holds SLOTS-1 usable */
+#define PCV_DNS_RING_MASK  (PCV_DNS_RING_SLOTS - 1u)
+
+typedef struct {
+    uint32_t len;                       /* copy_len actually stored (<= SLOT) */
+    uint8_t  bytes[PCV_DNS_SLOT_BYTES];
+} pcv_dns_slot;
+
 /* Modest defaults for the serve flow table (NOT the 65536 the ristretto-flow
  * sink uses): a smaller table bounds the once-per-second top-N scan. */
 #define PCV_DASH_DEFAULT_MAX_FLOWS    8192u
@@ -34,6 +48,7 @@ typedef struct {
     uint64_t packet_count;
     uint64_t byte_count;
     uint64_t duration_ns;
+    uint64_t last_seen_ns;         /* for the hosts-panel age (now_ns - last) */
     uint8_t  tcp_flags;
 } pcv_dash_flow_row;
 
@@ -82,6 +97,24 @@ struct pcv_dash_agg {
     uint64_t prev_pkts, prev_bytes, prev_ns;
     uint64_t prev_recv, prev_dropped;
     int      have_prev;
+
+    /* ---- Passive-DNS SPSC ring (capture writes; resolver drains). ----
+     * The ring lives INLINE here so the hot path writes it with no indirection.
+     * head is owned by the consumer (resolver), tail by the producer (capture);
+     * each is published with a release store and read with an acquire load, so
+     * the slot bytes a release-tail makes visible are safely read after the
+     * matching acquire. A full ring drops the copy and bumps dns_dropped
+     * (relaxed) - names are best-effort and MUST never stall capture. */
+    pcv_dns_slot     dns_ring[PCV_DNS_RING_SLOTS];
+    _Atomic uint32_t dns_head;             /* next slot to drain (consumer) */
+    _Atomic uint32_t dns_tail;             /* next slot to fill (producer) */
+    _Atomic uint64_t dns_dropped;          /* ring-full drops (diagnostic) */
+
+    /* ---- Names engine (set only under --serve). ----
+     * The resolver OWNS the IP->name map and its names_mtx; the capture thread
+     * can only ever see this pointer and the ring above, never the name lock. */
+    struct pcv_resolver* resolver;         /* NULL unless --serve */
+    uint32_t local_ip;                     /* HOST-order local IPv4 (you badge) */
 };
 
 /* Build the top-N ACTIVE-flow snapshot into agg->scratch. Reads the

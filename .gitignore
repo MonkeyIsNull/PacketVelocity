@@ -86,5 +86,6 @@ CLAUDE.md
 /tests/test_dashboard
 /tests/test_dashboard_safety
 /tests/test_http_guard
+/tests/test_resolve
 /bench/bench_pipeline
 

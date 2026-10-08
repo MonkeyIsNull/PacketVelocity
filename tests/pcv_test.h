@@ -225,4 +225,182 @@ static size_t pcv_build_arp_frame(uint8_t* buf, size_t buf_size,
     return total;
 }
 
+/* ---- DNS / mDNS response builders -------------------------------------- */
+
+/* One answer record to encode into a synthetic DNS message. type is 1 (A) or
+ * 28 (AAAA); for A, addr is 4 bytes; for AAAA, 16 bytes (network order). */
+typedef struct {
+    uint16_t type;              /* 1 = A, 28 = AAAA (others encoded verbatim) */
+    uint16_t rdlen_override;    /* 0 => use the natural rdlen (4 or 16) */
+    const uint8_t* rdata;       /* addr bytes (network order) */
+} pcv_dns_answer;
+
+/* Encode a DNS message body (header + one question + N answers) into out.
+ * - qname: a single dotted name, e.g. "lingq.com" (<=255).
+ * - qr: 1 => response (bit set), 0 => query.
+ * - cache_flush: OR 0x8001 into each answer CLASS (mDNS cache-flush) when set,
+ *   else class = 1 (IN).
+ * - compress_owner: when 1, each answer's OWNER NAME is the 0xC00C pointer back
+ *   to the question name (what real traffic does); when 0, the literal qname is
+ *   repeated inline.
+ * Returns the DNS message length, or 0 on overflow. This is the UDP PAYLOAD
+ * (what pcv_dns_parse consumes); the frame builders below prepend Eth+IP+UDP. */
+static size_t __attribute__((unused)) pcv_build_dns_msg(uint8_t* out, size_t out_size,
+                                const char* qname, uint16_t qtype,
+                                int qr, int cache_flush, int compress_owner,
+                                const pcv_dns_answer* answers, int nanswers) {
+    size_t o = 0;
+    if (out_size < 12) return 0;
+
+    /* ---- Header ---- */
+    out[0] = 0x12; out[1] = 0x34;                 /* id */
+    uint16_t flags = qr ? 0x8180 : 0x0100;        /* QR+RD+RA (resp) / RD (query) */
+    out[2] = (uint8_t)(flags >> 8); out[3] = (uint8_t)(flags & 0xFF);
+    out[4] = 0x00; out[5] = 0x01;                 /* QDCOUNT = 1 */
+    out[6] = (uint8_t)(nanswers >> 8); out[7] = (uint8_t)(nanswers & 0xFF);
+    out[8] = 0x00; out[9] = 0x00;                 /* NSCOUNT */
+    out[10] = 0x00; out[11] = 0x00;               /* ARCOUNT */
+    o = 12;
+
+    /* ---- Encode the question name as DNS labels (record offset 12). ---- */
+    size_t name_off = o;
+    {
+        const char* p = qname;
+        while (*p) {
+            const char* dot = strchr(p, '.');
+            size_t llen = dot ? (size_t)(dot - p) : strlen(p);
+            if (llen == 0 || llen > 63) return 0;
+            if (o + 1 + llen > out_size) return 0;
+            out[o++] = (uint8_t)llen;
+            memcpy(out + o, p, llen); o += llen;
+            if (!dot) break;
+            p = dot + 1;
+        }
+        if (o + 1 > out_size) return 0;
+        out[o++] = 0x00;                          /* root label */
+    }
+    if (o + 4 > out_size) return 0;
+    out[o++] = (uint8_t)(qtype >> 8); out[o++] = (uint8_t)(qtype & 0xFF);
+    out[o++] = 0x00; out[o++] = 0x01;             /* QCLASS = IN */
+
+    /* ---- Answers ---- */
+    for (int i = 0; i < nanswers; i++) {
+        const pcv_dns_answer* an = &answers[i];
+        /* OWNER NAME */
+        if (compress_owner) {
+            if (o + 2 > out_size) return 0;
+            out[o++] = (uint8_t)(0xC0 | ((name_off >> 8) & 0x3F));
+            out[o++] = (uint8_t)(name_off & 0xFF);
+        } else {
+            const char* p = qname;
+            while (*p) {
+                const char* dot = strchr(p, '.');
+                size_t llen = dot ? (size_t)(dot - p) : strlen(p);
+                if (llen == 0 || llen > 63) return 0;
+                if (o + 1 + llen > out_size) return 0;
+                out[o++] = (uint8_t)llen;
+                memcpy(out + o, p, llen); o += llen;
+                if (!dot) break;
+                p = dot + 1;
+            }
+            if (o + 1 > out_size) return 0;
+            out[o++] = 0x00;
+        }
+        uint16_t rdlen = an->rdlen_override ? an->rdlen_override
+                       : (an->type == 1 ? 4 : (an->type == 28 ? 16 : 0));
+        uint16_t cls = cache_flush ? 0x8001 : 0x0001;
+        if (o + 10 + rdlen > out_size) return 0;
+        out[o++] = (uint8_t)(an->type >> 8); out[o++] = (uint8_t)(an->type & 0xFF);
+        out[o++] = (uint8_t)(cls >> 8); out[o++] = (uint8_t)(cls & 0xFF);
+        out[o++] = 0x00; out[o++] = 0x00; out[o++] = 0x00; out[o++] = 0x3C; /* TTL 60 */
+        out[o++] = (uint8_t)(rdlen >> 8); out[o++] = (uint8_t)(rdlen & 0xFF);
+        if (rdlen && an->rdata) { memcpy(out + o, an->rdata, rdlen); }
+        o += rdlen;
+    }
+    return o;
+}
+
+/* Build Eth+IPv4+UDP carrying a DNS message. src_port/dst_port are the UDP
+ * ports (a classic reply uses src_port 53; mDNS uses 5353). src_ip/dst_ip are
+ * host-order IPv4. Returns the total frame length (0 on overflow). */
+static size_t __attribute__((unused)) pcv_build_dns_ipv4(uint8_t* buf, size_t buf_size,
+                                 uint32_t src_ip, uint32_t dst_ip,
+                                 uint16_t src_port, uint16_t dst_port,
+                                 const char* qname, uint16_t qtype,
+                                 int qr, int cache_flush, int compress_owner,
+                                 const pcv_dns_answer* answers, int nanswers) {
+    uint8_t msg[1024];
+    size_t mlen = pcv_build_dns_msg(msg, sizeof(msg), qname, qtype, qr,
+                                    cache_flush, compress_owner,
+                                    answers, nanswers);
+    if (mlen == 0) return 0;
+
+    const size_t eth = 14, ip = 20, udp = 8;
+    size_t total = eth + ip + udp + mlen;
+    if (total > buf_size) return 0;
+    memset(buf, 0, total);
+
+    static const uint8_t dmac[6] = {0x02,0,0,0,0,0x01};
+    static const uint8_t smac[6] = {0x02,0,0,0,0,0x02};
+    memcpy(buf, dmac, 6); memcpy(buf + 6, smac, 6);
+    buf[12] = 0x08; buf[13] = 0x00;
+
+    uint8_t* iph = buf + eth;
+    iph[0] = 0x45;
+    uint16_t iptot = (uint16_t)(ip + udp + mlen);
+    iph[2] = (uint8_t)(iptot >> 8); iph[3] = (uint8_t)(iptot & 0xFF);
+    iph[8] = 64; iph[9] = 17;                      /* TTL, proto UDP */
+    uint32_t s = htonl(src_ip), d = htonl(dst_ip);
+    memcpy(iph + 12, &s, 4); memcpy(iph + 16, &d, 4);
+
+    uint8_t* u = iph + ip;
+    uint16_t sp = htons(src_port), dp = htons(dst_port);
+    memcpy(u, &sp, 2); memcpy(u + 2, &dp, 2);
+    uint16_t ulen = (uint16_t)(udp + mlen);
+    u[4] = (uint8_t)(ulen >> 8); u[5] = (uint8_t)(ulen & 0xFF);
+    memcpy(u + udp, msg, mlen);
+    return total;
+}
+
+/* Build Eth+IPv6+UDP carrying a DNS message (ethertype 0x86DD) - proves the
+ * hot-path IPv6 DNS gate (e.g. a reply from ff02::fb over IPv6). */
+static size_t __attribute__((unused)) pcv_build_dns_ipv6(uint8_t* buf, size_t buf_size,
+                                 const uint8_t src_ip6[16],
+                                 const uint8_t dst_ip6[16],
+                                 uint16_t src_port, uint16_t dst_port,
+                                 const char* qname, uint16_t qtype,
+                                 int qr, int cache_flush, int compress_owner,
+                                 const pcv_dns_answer* answers, int nanswers) {
+    uint8_t msg[1024];
+    size_t mlen = pcv_build_dns_msg(msg, sizeof(msg), qname, qtype, qr,
+                                    cache_flush, compress_owner,
+                                    answers, nanswers);
+    if (mlen == 0) return 0;
+
+    const size_t eth = 14, ip6 = 40, udp = 8;
+    size_t total = eth + ip6 + udp + mlen;
+    if (total > buf_size) return 0;
+    memset(buf, 0, total);
+
+    static const uint8_t dmac[6] = {0x02,0,0,0,0,0x01};
+    static const uint8_t smac[6] = {0x02,0,0,0,0,0x02};
+    memcpy(buf, dmac, 6); memcpy(buf + 6, smac, 6);
+    buf[12] = 0x86; buf[13] = 0xDD;
+
+    uint8_t* iph = buf + eth;
+    iph[0] = 0x60;
+    uint16_t plen = (uint16_t)(udp + mlen);
+    iph[4] = (uint8_t)(plen >> 8); iph[5] = (uint8_t)(plen & 0xFF);
+    iph[6] = 17; iph[7] = 64;                      /* next header UDP, hop limit */
+    memcpy(iph + 8, src_ip6, 16); memcpy(iph + 24, dst_ip6, 16);
+
+    uint8_t* u = iph + ip6;
+    uint16_t sp = htons(src_port), dp = htons(dst_port);
+    memcpy(u, &sp, 2); memcpy(u + 2, &dp, 2);
+    uint16_t ulen = (uint16_t)(udp + mlen);
+    u[4] = (uint8_t)(ulen >> 8); u[5] = (uint8_t)(ulen & 0xFF);
+    memcpy(u + udp, msg, mlen);
+    return total;
+}
+
 #endif /* PCV_TEST_H */
