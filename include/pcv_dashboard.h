@@ -42,6 +42,9 @@ typedef enum {
 /* Opaque aggregated state. */
 typedef struct pcv_dash_agg pcv_dash_agg;
 
+/* The IP->name resolver (opaque; see pcv_resolve.h). Only set under --serve. */
+struct pcv_resolver;
+
 /* Create / destroy the aggregator.
  *   serve_max_flows / serve_hash_buckets size the private flow table that the
  *     capture thread feeds (a MODEST default is used when 0 is passed, so the
@@ -53,6 +56,19 @@ pcv_dash_agg* pcv_dash_create(uint32_t serve_max_flows,
                               uint32_t serve_hash_buckets,
                               uint32_t topn);
 void pcv_dash_destroy(pcv_dash_agg* agg);
+
+/* Wire the names engine (optional; --serve only). Once set, the hot path copies
+ * DNS/mDNS UDP payloads into the aggregator's inline SPSC ring for the resolver
+ * to drain, and pcv_dash_snapshot_json decorates flow rows + the hosts panel
+ * with names via pcv_resolve_lookup. Safe to leave NULL: names are then empty
+ * and hosts[] is still emitted (raw IPs). Must be called before capture starts
+ * and the resolver must outlive every snapshot_json call. */
+void pcv_dash_set_resolver(pcv_dash_agg* agg, struct pcv_resolver* resolver);
+
+/* Record the local interface IPv4 (HOST byte order, as get_interface_ip
+ * returns) so the serializer can emit a `local` meta string and the UI can tag
+ * the matching endpoint with a `you` badge (IPv4-only for the MVP). */
+void pcv_dash_set_local_ip(pcv_dash_agg* agg, uint32_t local_ip_host_order);
 
 /* HOT PATH. Called from the capture callback (or the replay callback in tests)
  * once per accepted packet. Cheap + allocation/lock/IO-free (trylock publish is
@@ -76,11 +92,20 @@ void pcv_dash_sample_with_stats(pcv_dash_agg* agg,
                                 uint64_t recv, uint64_t dropped,
                                 uint64_t now_ns);
 
-/* HTTP THREAD. Pure serializer: builds the three-panel /stats.json payload from
- * the atomics + the published flow snapshot + the rate ring into buf. Does no
- * agg mutation and no socket I/O (the caller writes the socket AFTER this
- * returns, holding no lock). Returns the number of bytes written (excluding the
- * NUL), or 0 on error / NULL agg. */
+/* HTTP THREAD. Pure serializer: builds the /stats.json payload from the atomics
+ * + the published flow snapshot + the rate ring into buf. Does no agg mutation
+ * and no socket I/O (the caller writes the socket AFTER this returns, holding no
+ * lock). Returns the number of bytes written (excluding the NUL), or 0 on error
+ * / NULL agg.
+ *
+ * Added by the names engine (all tolerate agg->resolver==NULL -> empty names,
+ * raw-IP hosts[]):
+ *   - each flow row gains discrete src_ip/src_port/dst_ip/dst_port and
+ *     src_name/dst_name (sanitized, possibly ""), alongside the existing tuple;
+ *   - a hosts[] array: {ip,name,pkts,bytes,last_seen} per distinct endpoint IP,
+ *     top-N by bytes, reduced from the published flow snapshot;
+ *   - a `local` string (the local IPv4) and now_ns (max last_seen across rows)
+ *     so the client renders a skew-free host age and tags the `you` endpoint. */
 size_t pcv_dash_snapshot_json(pcv_dash_agg* agg, char* buf, size_t size);
 
 #ifdef __cplusplus

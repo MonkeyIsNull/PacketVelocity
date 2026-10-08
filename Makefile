@@ -103,6 +103,7 @@ CORE_SOURCES = src/pcv_main.c \
                src/pcv_format.c \
                src/pcv_dashboard.c \
                src/pcv_dash_hot.c \
+               src/pcv_resolve.c \
                src/pcv_http.c
 
 # Optional RistrettoDB output backend sources (only when RISTRETTO=1)
@@ -216,7 +217,8 @@ clean:
 	# RISTRETTO=1, so remove them explicitly to keep a default clean tidy.
 	rm -f src/pcv_output_ristretto.o src/pcv_output_ristretto_flow.o
 	rm -f tests/test_ringbuf tests/test_flow tests/test_replay tests/test_display tests/test_ristretto tests/test_ristretto_flow
-	rm -f tests/test_dashboard tests/test_http_guard tests/test_dashboard_safety
+	rm -f tests/test_dashboard tests/test_http_guard tests/test_dashboard_safety tests/test_resolve
+	rm -rf tests/test_resolve.dSYM
 	rm -f bench/bench_pipeline bench/*.o
 	rm -f examples/simple_capture
 	@echo "Cleaned build artifacts"
@@ -253,17 +255,23 @@ test:
 	@echo "Building dashboard aggregation test (offline replay, no root)..."
 	$(CC) $(CFLAGS) $(BASE_INCLUDES) \
 	    $(TEST_DIR)/test_dashboard.c $(TEST_DIR)/pcap_replay.c \
-	    src/pcv_dashboard.c src/pcv_dash_hot.c src/pcv_flow.c \
+	    src/pcv_dashboard.c src/pcv_dash_hot.c src/pcv_resolve.c src/pcv_flow.c \
 	    -o $(TEST_DIR)/test_dashboard
 	@echo "Building HTTP loopback-bind + no-external-URL guard test..."
 	$(CC) $(CFLAGS) $(BASE_INCLUDES) \
 	    $(TEST_DIR)/test_http_guard.c \
-	    src/pcv_http.c src/pcv_dashboard.c src/pcv_dash_hot.c src/pcv_flow.c \
+	    src/pcv_http.c src/pcv_dashboard.c src/pcv_dash_hot.c src/pcv_resolve.c \
+	    src/pcv_flow.c \
 	    -o $(TEST_DIR)/test_http_guard
+	@echo "Building IP->name resolver test under AddressSanitizer..."
+	$(CC) $(CFLAGS) -fsanitize=address -g $(BASE_INCLUDES) \
+	    $(TEST_DIR)/test_resolve.c \
+	    src/pcv_resolve.c src/pcv_dashboard.c src/pcv_dash_hot.c src/pcv_flow.c \
+	    -o $(TEST_DIR)/test_resolve
 	@echo "Building drop-safety test under ThreadSanitizer..."
 	$(CC) $(CFLAGS) -fsanitize=thread -g $(BASE_INCLUDES) \
 	    $(TEST_DIR)/test_dashboard_safety.c \
-	    src/pcv_dashboard.c src/pcv_dash_hot.c src/pcv_flow.c \
+	    src/pcv_dashboard.c src/pcv_dash_hot.c src/pcv_resolve.c src/pcv_flow.c \
 	    -o $(TEST_DIR)/test_dashboard_safety
 ifeq ($(RISTRETTO),1)
 	@echo "Building RistrettoDB V2 sink test (RISTRETTO=1)..."
@@ -295,6 +303,9 @@ endif
 	@echo ""
 	@echo "=== test_http_guard (loopback-bind + no-external-URL guards) ==="
 	@./$(TEST_DIR)/test_http_guard
+	@echo ""
+	@echo "=== test_resolve (passive-DNS parse + map + PTR + XSS, ASan) ==="
+	@./$(TEST_DIR)/test_resolve
 	@echo ""
 	@echo "=== test_dashboard_safety (hot-path source guard + TSan) ==="
 	@./$(TEST_DIR)/test_dashboard_safety

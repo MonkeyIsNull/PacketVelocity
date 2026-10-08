@@ -25,7 +25,9 @@
 #include <unistd.h>
 
 #include "pcv_platform.h"
+#include "pcv_flow.h"
 #include "pcv_dashboard.h"
+#include "pcv_resolve.h"
 #include "pcap_replay.h"
 #include "pcv_test.h"
 
@@ -266,8 +268,57 @@ static void test_rates(void) {
     }
 }
 
+/* ---- 3. passive-DNS names decorate flow rows + hosts panel -------------- */
+
+static void test_names(void) {
+    fprintf(stdout, "passive-DNS names on flow rows + hosts panel\n");
+
+    pcv_dash_agg* agg = pcv_dash_create(0, 0, 0);
+    pcv_resolver* r = pcv_resolver_create(agg, NULL, NULL);
+    CHECK(agg && r, "create agg + resolver");
+    pcv_dash_set_resolver(agg, r);
+    pcv_dash_set_local_ip(agg, 0x0A000001u);
+
+    static uint8_t frame[1024];
+
+    /* A DNS reply mapping example.com -> 93.184.216.34 (compressed owner). */
+    uint8_t a1[4];
+    uint32_t ipnet = htonl(0x5DB8D822u);
+    memcpy(a1, &ipnet, 4);
+    pcv_dns_answer an = { 1, 0, a1 };
+    size_t fl = pcv_build_dns_ipv4(frame, sizeof(frame), 0x08080808u,
+                                   0x0A000001u, 53, 33333, "example.com", 1,
+                                   1, 0, 1, &an, 1);
+    CHECK(fl > 0, "build DNS reply frame");
+    feed(agg, frame, (uint32_t)fl, (uint32_t)fl, 1000000000ULL);
+
+    /* Drain the passive answer, then a flow to the named endpoint. */
+    pcv_resolver_drain_once(r);
+    fl = pcv_build_ipv4_frame(frame, sizeof(frame), 6, 0x0A000001u, 0x5DB8D822u,
+                              1234, 443, 0x02, 40);
+    feed(agg, frame, (uint32_t)fl, (uint32_t)fl, 2000000000ULL);
+
+    pcv_dash_force_snapshot(agg);
+
+    static char json[65536];
+    size_t jlen = pcv_dash_snapshot_json(agg, json, sizeof(json));
+    CHECK(jlen > 0, "serialize /stats.json");
+    CHECK(strstr(json, "\"dst_name\":\"example.com\"") != NULL,
+          "flow row dst_name = example.com (passive DNS)");
+    CHECK(strstr(json, "\"src_ip\":\"10.0.0.1\"") != NULL,
+          "flow row discrete src_ip present");
+    CHECK(strstr(json, "\"hosts\":[") != NULL, "hosts panel present");
+    CHECK(strstr(json, "\"local\":\"10.0.0.1\"") != NULL,
+          "local IPv4 emitted (htonl-correct)");
+
+    pcv_dash_set_resolver(agg, NULL);
+    pcv_resolver_destroy(r);
+    pcv_dash_destroy(agg);
+}
+
 int main(void) {
     test_aggregation();
     test_rates();
+    test_names();
     return pcv_test_summary("test_dashboard");
 }
