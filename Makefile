@@ -209,6 +209,7 @@ clean:
 	# RISTRETTO=1, so remove them explicitly to keep a default clean tidy.
 	rm -f src/pcv_output_ristretto.o src/pcv_output_ristretto_flow.o
 	rm -f tests/test_ringbuf tests/test_flow tests/test_replay tests/test_ristretto tests/test_ristretto_flow
+	rm -f bench/bench_pipeline bench/*.o
 	rm -f examples/simple_capture
 	@echo "Cleaned build artifacts"
 
@@ -269,6 +270,61 @@ ifeq ($(RISTRETTO),1)
 endif
 	@echo ""
 	@echo "All tests passed."
+
+# ---- Offline processing-pipeline benchmark -------------------------------
+# `make bench` builds and runs bench/bench_pipeline, which measures the
+# POST-CAPTURE pipeline (filter -> flow -> output) on a large, in-memory,
+# deterministically-generated packet set. It is OFFLINE: it never opens a NIC
+# and never needs root. Live capture off the wire is out of scope (needs sudo +
+# real hardware) and is NOT benchmarked here.
+#
+#   make bench                 - default (hermetic) build: stages a-c + stdout
+#   make bench RISTRETTO=1      - also measures both RistrettoDB V2 sinks
+#   make bench BENCH_QUICK=1    - tiny-N smoke run (no perf meaning; for CI)
+#
+# The default `make bench` links ZERO RistrettoDB symbols, exactly like the
+# default `make`. The benchmark is compiled with the VFM (gnu11) flags because
+# it links the VFM filter path, mirroring the test/examples targets.
+BENCH_DIR = bench
+BENCH_QUICK ?= 0
+
+BENCH_CFLAGS = $(VFM_CFLAGS) $(TEST_PLATFORM_CFLAGS)
+BENCH_EXTRA_SOURCES =
+BENCH_EXTRA_LDFLAGS =
+ifeq ($(RISTRETTO),1)
+    BENCH_CFLAGS += -DHAVE_RISTRETTO=1
+    BENCH_EXTRA_SOURCES = src/pcv_output_ristretto.c src/pcv_output_ristretto_flow.c
+    BENCH_EXTRA_LDFLAGS = $(RISTRETTO_LDFLAGS)
+endif
+ifeq ($(BENCH_QUICK),1)
+    BENCH_CFLAGS += -DBENCH_QUICK=1
+endif
+
+.PHONY: bench bench-build
+# Build only (no run) - used by CI to prove the bench cannot silently rot in
+# either build mode without imposing any perf threshold.
+bench-build: $(BENCH_DIR)/bench_pipeline
+	@echo "Built $(BENCH_DIR)/bench_pipeline (RISTRETTO=$(RISTRETTO), BENCH_QUICK=$(BENCH_QUICK))"
+
+bench: $(BENCH_DIR)/bench_pipeline
+	@echo ""
+	@./$(BENCH_DIR)/bench_pipeline
+
+# FORCE a recompile every time: the binary path is the same for the default and
+# RISTRETTO=1 builds, so without this, `make bench` then `make bench RISTRETTO=1`
+# would see an up-to-date binary and silently run the wrong mode.
+.PHONY: FORCE
+FORCE:
+
+$(BENCH_DIR)/bench_pipeline: $(BENCH_DIR)/bench_pipeline.c \
+                             src/pcv_filter_vfm.c src/pcv_flow.c \
+                             $(BENCH_EXTRA_SOURCES) $(VFLISP_SOURCES) FORCE
+	@echo "Compiling offline pipeline benchmark (RISTRETTO=$(RISTRETTO))..."
+	$(CC) $(BENCH_CFLAGS) $(BASE_INCLUDES) -I$(TEST_DIR) $(VFM_INCLUDES) \
+	    $(RISTRETTO_INCLUDES) \
+	    $(BENCH_DIR)/bench_pipeline.c src/pcv_filter_vfm.c src/pcv_flow.c \
+	    $(BENCH_EXTRA_SOURCES) $(VFLISP_SOURCES) \
+	    -o $@ $(VFM_LDFLAGS) $(BENCH_EXTRA_LDFLAGS)
 
 # ---- Example programs ----------------------------------------------------
 # NOTE: the Makefile builds the `packetvelocity` CLI binary, not a

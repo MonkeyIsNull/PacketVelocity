@@ -122,3 +122,60 @@ jobs:
       - name: Run offline tests incl. both RistrettoDB V2 sink round-trips
         working-directory: PacketVelocity
         run: make RISTRETTO=1 test
+
+  # Benchmark build-check + tiny smoke. This is NOT a perf-gating job: it imposes
+  # NO throughput thresholds (perf flakes across runners). It only proves the
+  # `make bench` target keeps COMPILING and RUNNING in BOTH build modes so it
+  # cannot silently rot. Real perf numbers are produced by `make bench` on real
+  # hardware (see BENCHMARKS.md), never in CI and never under emulation.
+  bench-smoke:
+    name: bench compiles + tiny smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - name: Checkout PacketVelocity
+        uses: actions/checkout@v4
+        with:
+          path: PacketVelocity
+
+      - name: Checkout VelocityFilterMachine
+        uses: actions/checkout@v4
+        with:
+          repository: MonkeyIsNull/VelocityFilterMachine
+          path: VelocityFilterMachine
+
+      - name: Checkout RistrettoDB
+        uses: actions/checkout@v4
+        with:
+          repository: MonkeyIsNull/RistrettoDB
+          path: RistrettoDB
+
+      - name: Build VelocityFilterMachine (libvfm.a)
+        working-directory: VelocityFilterMachine
+        run: make libvfm.a
+
+      - name: Build RistrettoDB (static lib)
+        working-directory: RistrettoDB
+        run: make static
+
+      # Default (hermetic) build: stages a-c + stdout, ZERO RistrettoDB symbols.
+      - name: Default bench - compile + tiny smoke (BENCH_QUICK=1)
+        working-directory: PacketVelocity
+        run: make bench BENCH_QUICK=1
+
+      - name: Verify the default bench binary pulls in no RistrettoDB code
+        working-directory: PacketVelocity
+        run: |
+          if nm bench/bench_pipeline | grep -i ristretto; then
+            echo "ERROR: default bench references RistrettoDB symbols" >&2
+            exit 1
+          fi
+          echo "OK: default bench is free of RistrettoDB symbols"
+
+      # RISTRETTO=1 build: all six stages incl. both RistrettoDB V2 sinks.
+      - name: RISTRETTO=1 bench - compile + tiny smoke (BENCH_QUICK=1)
+        working-directory: PacketVelocity
+        run: make clean && make bench RISTRETTO=1 BENCH_QUICK=1

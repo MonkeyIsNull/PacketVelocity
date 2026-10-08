@@ -216,14 +216,46 @@ sudo ./packetvelocity -i en0 -l "(= proto 6)" --output ristretto:/tmp/tcp_captur
 sudo ./packetvelocity -i en0 -l "(= proto 6)" --output ristretto-flow:/tmp/tcp_flows
 ```
 
-## Performance Targets
+## Performance
 
-These are **design goals**, not benchmarked results on this alpha codebase.
+Real, **measured** numbers for the **offline processing pipeline** (everything
+after capture: filter → flow tracking → output), produced by `make bench`
+(source: [`bench/bench_pipeline.c`](bench/bench_pipeline.c)). Full methodology,
+the exact packet mix, and caveats are in **[BENCHMARKS.md](BENCHMARKS.md)**.
 
-| Platform | Target | Packet Size | Status |
-|----------|--------|-------------|---------|
-| macOS BPF | 500K-1M pps | 64 byte | Backend implemented (not benchmarked) |
-| Linux Raw Sockets | 100K-500K pps | 64 byte | Backend implemented, untested |
+> **Offline, post-capture numbers — not live capture off the wire.** Live
+> capture needs root + a real NIC and is **out of scope** for this benchmark.
+
+Measured on an **Apple M1** (`MacBookPro17,1`, 8 cores, macOS Darwin 24.6.0
+arm64, clang 17.0.0) over **2,000,000** in-memory frames (mixed IPv4/IPv6,
+TCP/UDP, 64–1514 B, mean 610 B, 20,000 distinct flows). Throughput is per input
+packet; best of 7 timed runs (median in parentheses):
+
+| stage (cumulative)         | throughput (Mpps) | ns/packet |
+|----------------------------|------------------:|----------:|
+| baseline (replay loop)     |    197.8 (189.3)  |  5.1 (5.3) |
+| + filter (VFM/VFLisp JIT)  |     13.8 (13.4)   | 72.7 (74.7)|
+| + flow tracking (v4/v6)    |      9.6 (9.4)    | 104.6 (106.8)|
+| + stdout format (→/dev/null) | 0.98 (0.97)     | 1025 (1031)|
+| + RistrettoDB, per-packet  |      1.09 (1.08)  | 918 (928)  |
+| + RistrettoDB, per-flow    |      2.80 (2.79)  | 357 (359)  |
+
+The last two rows require `make bench RISTRETTO=1`. The RistrettoDB sinks write
+to a temp `.rdb` file so real `mmap`/disk I/O is included.
+
+**Caveats:** (i) these are **offline processing-pipeline** numbers, not
+live-capture-off-the-wire; (ii) they reflect this specific Apple M1 — treat them
+as a ballpark and a **relative stage comparison**, not a guarantee for other
+hardware; (iii) **live-capture + Linux-hardware numbers are still TODO** (need
+sudo + a Linux box). No Docker/QEMU-emulated numbers are ever reported (they are
+meaningless for throughput). See [BENCHMARKS.md](BENCHMARKS.md) to reproduce.
+
+### Backend status (not yet benchmarked)
+
+| Platform | Capture backend | Status |
+|----------|-----------------|--------|
+| macOS BPF | `/dev/bpf*` + mmap | Implemented, actively used (live-capture rate not yet benchmarked) |
+| Linux Raw Sockets | AF_PACKET | Implemented, untested |
 
 ## Examples
 
