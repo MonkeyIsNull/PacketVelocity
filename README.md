@@ -1,6 +1,7 @@
 # PacketVelocity
 
 [![CI](https://github.com/MonkeyIsNull/PacketVelocity/actions/workflows/ci.yml/badge.svg)](https://github.com/MonkeyIsNull/PacketVelocity/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/MonkeyIsNull/PacketVelocity)](https://github.com/MonkeyIsNull/PacketVelocity/releases/latest)
 ![tests](https://img.shields.io/badge/tests-68%20passing-brightgreen)
 ![language](https://img.shields.io/badge/language-C%20(C11)-blue)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
