@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <sys/types.h>
 #include "pcv_platform.h"
 
@@ -38,10 +39,13 @@ typedef struct pcv_bpf_handle {
     uint32_t timeout_ms;        /* Read timeout */
     volatile bool break_loop;   /* Signal to break capture loop */
     
-    /* Statistics */
-    uint64_t packets_seen;      /* Packets processed */
-    uint64_t packets_dropped;   /* Dropped by kernel */
-    uint64_t bytes_received;    /* Total bytes */
+    /* Statistics. packets_seen/bytes_received are _Atomic because the dashboard
+     * sampler thread reads them (via macos_get_stats) concurrently with the
+     * capture thread's updates; relaxed atomics are as cheap as the previous
+     * plain adds and keep the read TSan-clean. */
+    _Atomic uint64_t packets_seen;      /* Packets processed */
+    uint64_t packets_dropped;           /* Dropped by kernel */
+    _Atomic uint64_t bytes_received;    /* Total bytes */
     
     /* Error handling */
     char error_buffer[256];     /* Last error message */

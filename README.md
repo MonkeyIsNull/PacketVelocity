@@ -227,6 +227,38 @@ sudo ./packetvelocity -i en0 -l "(= proto 6)" --output ristretto:/tmp/tcp_captur
 sudo ./packetvelocity -i en0 -l "(= proto 6)" --output ristretto-flow:/tmp/tcp_flows
 ```
 
+### Live dashboard (`--serve`)
+
+`--serve <port>` serves a self-contained live dashboard instead of the stdout
+stream. One HTML page (no external URLs, no CDN, inline SVG charts) plus a small
+JSON API (`/stats.json`, `/healthz`) with three panels: **capture health**
+(packets/s, Mbit/s, and a prominent **drop-rate / buffer-health** indicator),
+**protocol mix** (TCP/UDP/ICMP/ARP/IPv6/other), and a **top live-flow table**.
+
+```bash
+# Capture needs root; the HTTP server binds LOOPBACK ONLY (127.0.0.1).
+sudo ./packetvelocity -i en0 --serve 8080      # then open http://127.0.0.1:8080
+sudo ./packetvelocity -i en0 --serve 0 -v      # 0 = auto-pick a free loopback port
+```
+
+Notes:
+
+- **Root is for capture, not the web server.** `--serve` still opens `/dev/bpf*`
+  (macOS) / a raw socket (Linux), which needs `sudo`. The HTTP bind itself needs
+  no privilege.
+- **Loopback only, always.** The server binds `127.0.0.1` exclusively (validated
+  before *and* after `bind()`); there is no flag to expose it on a LAN. A
+  DNS-rebinding `Host` check and a zero-CORS response posture guard it further.
+- **The per-packet stdout stream is suppressed** in this mode (deliberate; the
+  tcpdump-style stream and the dashboard are mutually exclusive). `--serve`
+  cannot be combined with `--output ristretto:`/`ristretto-flow:`.
+- **The hot capture path is never slowed by serving.** The packet callback only
+  does cheap work (atomic counters + the existing flow update + a wait-free,
+  trylock-published ≤1 Hz snapshot); the HTTP server and a 1 Hz sampler run on
+  separate threads and only read a published snapshot. A ThreadSanitizer CI leg
+  proves the isolation. Without `--serve`, zero threads or sockets are created
+  and the default path is unchanged.
+
 ## Performance
 
 Real, **measured** numbers for the **offline processing pipeline** (everything

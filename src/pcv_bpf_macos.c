@@ -302,10 +302,14 @@ static int macos_capture(pcv_handle* handle, pcv_callback callback, void* user_d
             packet.interface_index = 0; /* Not provided by BPF */
             packet.flags = 0;
             
-            /* Update statistics */
-            bpf_handle->packets_seen++;
-            bpf_handle->bytes_received += packet.captured_length;
-            
+            /* Update statistics (relaxed atomic: the sampler thread may read
+             * these concurrently via macos_get_stats). */
+            atomic_fetch_add_explicit(&bpf_handle->packets_seen, 1u,
+                                      memory_order_relaxed);
+            atomic_fetch_add_explicit(&bpf_handle->bytes_received,
+                                      packet.captured_length,
+                                      memory_order_relaxed);
+
             /* Call user callback */
             callback(&packet, user_data);
             
@@ -377,10 +381,13 @@ static int macos_capture_batch(pcv_handle* handle, pcv_batch_callback callback, 
             packets[packet_count].interface_index = 0;
             packets[packet_count].flags = 0;
             
-            /* Update statistics */
-            bpf_handle->packets_seen++;
-            bpf_handle->bytes_received += packets[packet_count].captured_length;
-            
+            /* Update statistics (relaxed atomic; see macos_capture). */
+            atomic_fetch_add_explicit(&bpf_handle->packets_seen, 1u,
+                                      memory_order_relaxed);
+            atomic_fetch_add_explicit(&bpf_handle->bytes_received,
+                                      packets[packet_count].captured_length,
+                                      memory_order_relaxed);
+
             packet_count++;
             
             /* Move to next packet */
@@ -428,8 +435,10 @@ static int macos_get_stats(pcv_handle* handle, pcv_stats* stats) {
     
     stats->packets_received = bpf_stats.bs_recv;
     stats->packets_dropped = bpf_stats.bs_drop;
-    stats->packets_filtered = bpf_handle->packets_seen;
-    stats->bytes_received = bpf_handle->bytes_received;
+    stats->packets_filtered =
+        atomic_load_explicit(&bpf_handle->packets_seen, memory_order_relaxed);
+    stats->bytes_received =
+        atomic_load_explicit(&bpf_handle->bytes_received, memory_order_relaxed);
     stats->buffer_overruns = 0; /* Not tracked by BPF */
     
     return PCV_SUCCESS;

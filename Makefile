@@ -10,7 +10,10 @@ CC = gcc
 else
 CC = clang
 endif
-CFLAGS = -Wall -Wextra -O3 -std=c11
+# -pthread is a SYSTEM/libc facility (not an external dependency): it is required
+# by the --serve dashboard's HTTP + sampler threads and leaves the hermetic
+# `nm | grep -i ristretto` guard untouched.
+CFLAGS = -Wall -Wextra -O3 -std=c11 -pthread
 DEBUG_FLAGS = -g -O0 -DDEBUG
 
 # Build mode: development (default) or production
@@ -88,8 +91,8 @@ BASE_INCLUDES = -I./include
 # Combined includes
 INCLUDES = $(BASE_INCLUDES) $(VFM_INCLUDES) $(RISTRETTO_INCLUDES)
 
-# Combined LDFLAGS
-LDFLAGS = $(VFM_LDFLAGS) $(RISTRETTO_LDFLAGS)
+# Combined LDFLAGS (-pthread: system lib, hermetic-safe - see CFLAGS note)
+LDFLAGS = $(VFM_LDFLAGS) $(RISTRETTO_LDFLAGS) -pthread
 
 # Core source files (terminal/stdout capture pipeline - no external output deps)
 CORE_SOURCES = src/pcv_main.c \
@@ -97,7 +100,10 @@ CORE_SOURCES = src/pcv_main.c \
                src/pcv_filter_vfm.c \
                src/pcv_ringbuf.c \
                src/pcv_flow.c \
-               src/pcv_format.c
+               src/pcv_format.c \
+               src/pcv_dashboard.c \
+               src/pcv_dash_hot.c \
+               src/pcv_http.c
 
 # Optional RistrettoDB output backend sources (only when RISTRETTO=1)
 CORE_SOURCES += $(RISTRETTO_SOURCES)
@@ -210,6 +216,7 @@ clean:
 	# RISTRETTO=1, so remove them explicitly to keep a default clean tidy.
 	rm -f src/pcv_output_ristretto.o src/pcv_output_ristretto_flow.o
 	rm -f tests/test_ringbuf tests/test_flow tests/test_replay tests/test_display tests/test_ristretto tests/test_ristretto_flow
+	rm -f tests/test_dashboard tests/test_http_guard tests/test_dashboard_safety
 	rm -f bench/bench_pipeline bench/*.o
 	rm -f examples/simple_capture
 	@echo "Cleaned build artifacts"
@@ -243,6 +250,21 @@ test:
 	$(CC) $(CFLAGS) $(BASE_INCLUDES) \
 	    $(TEST_DIR)/test_display.c src/pcv_format.c src/pcv_flow.c \
 	    -o $(TEST_DIR)/test_display
+	@echo "Building dashboard aggregation test (offline replay, no root)..."
+	$(CC) $(CFLAGS) $(BASE_INCLUDES) \
+	    $(TEST_DIR)/test_dashboard.c $(TEST_DIR)/pcap_replay.c \
+	    src/pcv_dashboard.c src/pcv_dash_hot.c src/pcv_flow.c \
+	    -o $(TEST_DIR)/test_dashboard
+	@echo "Building HTTP loopback-bind + no-external-URL guard test..."
+	$(CC) $(CFLAGS) $(BASE_INCLUDES) \
+	    $(TEST_DIR)/test_http_guard.c \
+	    src/pcv_http.c src/pcv_dashboard.c src/pcv_dash_hot.c src/pcv_flow.c \
+	    -o $(TEST_DIR)/test_http_guard
+	@echo "Building drop-safety test under ThreadSanitizer..."
+	$(CC) $(CFLAGS) -fsanitize=thread -g $(BASE_INCLUDES) \
+	    $(TEST_DIR)/test_dashboard_safety.c \
+	    src/pcv_dashboard.c src/pcv_dash_hot.c src/pcv_flow.c \
+	    -o $(TEST_DIR)/test_dashboard_safety
 ifeq ($(RISTRETTO),1)
 	@echo "Building RistrettoDB V2 sink test (RISTRETTO=1)..."
 	$(CC) $(CFLAGS) $(BASE_INCLUDES) $(RISTRETTO_INCLUDES) \
@@ -267,6 +289,15 @@ endif
 	@echo ""
 	@echo "=== test_display (packet display/decode: IPv4/IPv6/ARP/other) ==="
 	@./$(TEST_DIR)/test_display
+	@echo ""
+	@echo "=== test_dashboard (offline aggregation vs known replay) ==="
+	@./$(TEST_DIR)/test_dashboard
+	@echo ""
+	@echo "=== test_http_guard (loopback-bind + no-external-URL guards) ==="
+	@./$(TEST_DIR)/test_http_guard
+	@echo ""
+	@echo "=== test_dashboard_safety (hot-path source guard + TSan) ==="
+	@./$(TEST_DIR)/test_dashboard_safety
 ifeq ($(RISTRETTO),1)
 	@echo ""
 	@echo "=== test_ristretto (RistrettoDB V2 per-packet sink round-trip) ==="
