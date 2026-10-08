@@ -143,15 +143,16 @@ static const char PCV_DASHBOARD_HTML[] =
 "  function fmtDur(ms){ ms=ms||0; if(ms<1000)return Math.round(ms)+'ms'; var s=ms/1000; if(s<60)return s.toFixed(1)+'s'; var m=Math.floor(s/60); return m+'m'+Math.round(s-m*60)+'s'; }\n"
 "  function fmtAge(ns){ if(!(ns>0))return '-'; var s=ns/1e9; if(s<1)return '<1s'; if(s<60)return Math.round(s)+'s'; var m=Math.floor(s/60); if(m<60)return m+'m'+Math.round(s-m*60)+'s'; var h=Math.floor(m/60); return h+'h'+(m-h*60)+'m'; }\n"
 /* Build one endpoint element: prefer the resolved NAME, keep the raw IP in a
- * title (set via setAttribute, never innerHTML), tag the local host. All text
- * is written with textContent so an attacker-influenced name is inert. */
+ * title (set via setAttribute, never innerHTML). The local host is NOT tagged
+ * here -- one side of every flow is always the capturing host, so a per-row
+ * "you" badge is pure clutter; the HOSTS panel keeps the single useful marker.
+ * All text is written with textContent so an attacker-influenced name is inert. */
 "  function endpoint(ip,port,name,local){\n"
 "    var span=document.createElement('span'); span.className='ep';\n"
 "    var label=(name&&name.length)?name:ip; if(name&&name.length)span.className='ep named';\n"
 "    span.textContent=label+':'+port;\n"
 "    span.setAttribute('title',ip+':'+port);\n"
 "    var frag=document.createDocumentFragment(); frag.appendChild(span);\n"
-"    if(local&&ip===local){ var b=document.createElement('span'); b.className='you'; b.textContent='you'; frag.appendChild(b); }\n"
 "    return frag;\n"
 "  }\n"
 "  function setLevel(el,ratio){ el.classList.remove('lvl-ok','lvl-warn','lvl-bad'); if(ratio>=0.01)el.classList.add('lvl-bad'); else if(ratio>=0.001)el.classList.add('lvl-warn'); else el.classList.add('lvl-ok'); }\n"
