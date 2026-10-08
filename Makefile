@@ -74,7 +74,7 @@ RISTRETTO_SOURCES =
 ifeq ($(RISTRETTO),1)
     CFLAGS += -DHAVE_RISTRETTO=1
     RISTRETTO_INCLUDES = -I$(RISTRETTO_ROOT)/embed
-    RISTRETTO_SOURCES = src/pcv_output_ristretto.c
+    RISTRETTO_SOURCES = src/pcv_output_ristretto.c src/pcv_output_ristretto_flow.c
     ifeq ($(BUILD_MODE),production)
         RISTRETTO_LDFLAGS = -L$(PREFIX)/lib -lristretto
     else
@@ -205,7 +205,10 @@ install-deps:
 clean:
 	rm -f $(OBJECTS) $(TARGET)
 	rm -f tests/*.o benchmarks/*.o
-	rm -f tests/test_ringbuf tests/test_flow tests/test_replay tests/test_ristretto
+	# Optional RistrettoDB backend objects are only in $(OBJECTS) when
+	# RISTRETTO=1, so remove them explicitly to keep a default clean tidy.
+	rm -f src/pcv_output_ristretto.o src/pcv_output_ristretto_flow.o
+	rm -f tests/test_ringbuf tests/test_flow tests/test_replay tests/test_ristretto tests/test_ristretto_flow
 	rm -f examples/simple_capture
 	@echo "Cleaned build artifacts"
 
@@ -241,6 +244,11 @@ ifeq ($(RISTRETTO),1)
 	    $(TEST_DIR)/test_ristretto.c $(TEST_DIR)/pcap_replay.c \
 	    src/pcv_output_ristretto.c src/pcv_flow.c \
 	    -o $(TEST_DIR)/test_ristretto $(RISTRETTO_LDFLAGS)
+	@echo "Building RistrettoDB V2 per-flow sink test (RISTRETTO=1)..."
+	$(CC) $(CFLAGS) $(BASE_INCLUDES) $(RISTRETTO_INCLUDES) \
+	    $(TEST_DIR)/test_ristretto_flow.c $(TEST_DIR)/pcap_replay.c \
+	    src/pcv_output_ristretto_flow.c src/pcv_flow.c \
+	    -o $(TEST_DIR)/test_ristretto_flow $(RISTRETTO_LDFLAGS)
 endif
 	@echo ""
 	@echo "=== test_ringbuf ==="
@@ -253,8 +261,11 @@ endif
 	@./$(TEST_DIR)/test_replay
 ifeq ($(RISTRETTO),1)
 	@echo ""
-	@echo "=== test_ristretto (RistrettoDB V2 sink round-trip) ==="
+	@echo "=== test_ristretto (RistrettoDB V2 per-packet sink round-trip) ==="
 	@./$(TEST_DIR)/test_ristretto
+	@echo ""
+	@echo "=== test_ristretto_flow (RistrettoDB V2 per-flow sink round-trip) ==="
+	@./$(TEST_DIR)/test_ristretto_flow
 endif
 	@echo ""
 	@echo "All tests passed."
@@ -294,7 +305,8 @@ help:
 	@echo "Optional RistrettoDB output backend (opt-in, default OFF):"
 	@echo "  make RISTRETTO=1        - Build with the RistrettoDB V2 output backend"
 	@echo "  make RISTRETTO=1 RISTRETTO_ROOT=/path - Use a specific RistrettoDB checkout"
-	@echo "  then: ./packetvelocity -i <if> --output ristretto:<path>  (writes <path>.rdb)"
+	@echo "  then: ./packetvelocity -i <if> --output ristretto:<path>       (one row per packet)"
+	@echo "    or: ./packetvelocity -i <if> --output ristretto-flow:<path>  (one row per flow)"
 	@echo ""
 	@echo "Other targets:"
 	@echo "  make debug              - Build with debug symbols"
@@ -317,4 +329,5 @@ src/pcv_platform.o: include/pcv_platform.h
 src/pcv_bpf_macos.o: include/pcv_platform.h include/pcv_bpf_macos.h
 src/pcv_filter_vfm.o: include/pcv_filter.h
 src/pcv_output_ristretto.o: include/pcv_output.h
+src/pcv_output_ristretto_flow.o: include/pcv_output_flow.h include/pcv_flow.h
 src/pcv_ringbuf.o: include/pcv_ringbuf.h

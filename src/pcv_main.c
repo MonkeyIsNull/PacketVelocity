@@ -34,6 +34,7 @@
  * stays hermetic (no RistrettoDB include, no RistrettoDB symbols). */
 #if HAVE_RISTRETTO
 #include "pcv_output.h"
+#include "pcv_output_flow.h"
 #endif
 
 /* Global handle for signal handling */
@@ -53,7 +54,8 @@ typedef struct {
     char interface_name[32];
     bool has_ipv6;
 #if HAVE_RISTRETTO
-    pcv_output* output;   /* non-NULL => route packets to RistrettoDB, not stdout */
+    pcv_output* output;            /* non-NULL => per-packet RistrettoDB sink */
+    pcv_flow_output* flow_output;  /* non-NULL => per-flow RistrettoDB sink */
 #endif
 } callback_context;
 
@@ -253,6 +255,12 @@ static void packet_callback(const pcv_packet* packet, void* user_data) {
         pcv_output_packet(ctx->output, packet);
         return;
     }
+    /* Per-flow sink: aggregate into flows; rows are emitted on eviction and at
+     * shutdown, not per packet. */
+    if (ctx && ctx->flow_output) {
+        pcv_flow_output_update(ctx->flow_output, packet);
+        return;
+    }
 #endif
 
     /* Format timestamp and packet info with direction */
@@ -280,9 +288,11 @@ static void print_usage(const char* program) {
     printf("  -c, --packet-num <count>  Stop after capturing <count> packets\n");
     printf("  -t, --seconds-num <secs>  Stop after <secs> seconds\n");
     printf("  -o, --output <sink>       Output sink: '-'/'stdout' (default, tcpdump-style\n");
-    printf("                            stream) or 'ristretto:<path>' to append one row per\n");
-    printf("                            packet to a RistrettoDB V2 table at <path>.rdb\n");
-    printf("                            (requires a build with 'make RISTRETTO=1')\n");
+    printf("                            stream); 'ristretto:<path>' to append one row per\n");
+    printf("                            packet to a RistrettoDB V2 table at <path>.rdb; or\n");
+    printf("                            'ristretto-flow:<path>' to write one row per flow\n");
+    printf("                            (5-tuple conversation) to a 'flows' table at\n");
+    printf("                            <path>.rdb (both require 'make RISTRETTO=1')\n");
     printf("  -v, --verbose             Enable verbose output\n");
     printf("  -V, --version             Show version information\n");
     printf("  -h, --help                Show this help message\n");
@@ -430,10 +440,24 @@ int main(int argc, char* argv[]) {
      * stdout stream. "ristretto:<path>" routes packets to a RistrettoDB V2 table.
      * Validate (and fast-fail the not-compiled-in case) before touching the
      * capture device, which would otherwise need root. */
-    const char* ristretto_path = NULL;
+    const char* ristretto_path = NULL;       /* per-packet sink target */
+    const char* ristretto_flow_path = NULL;  /* per-flow sink target */
     if (output_spec && strcmp(output_spec, "-") != 0 &&
         strcmp(output_spec, "stdout") != 0) {
-        if (strncmp(output_spec, "ristretto:", 10) == 0) {
+        /* Check the longer, more specific prefix first. */
+        if (strncmp(output_spec, "ristretto-flow:", 15) == 0) {
+            ristretto_flow_path = output_spec + 15;
+            if (*ristretto_flow_path == '\0') {
+                fprintf(stderr, "Error: --output ristretto-flow: requires a path, "
+                                "e.g. --output ristretto-flow:/tmp/flows\n");
+                return 1;
+            }
+#if !HAVE_RISTRETTO
+            fprintf(stderr, "Error: this build has no RistrettoDB support; "
+                            "rebuild with make RISTRETTO=1\n");
+            return 1;
+#endif
+        } else if (strncmp(output_spec, "ristretto:", 10) == 0) {
             ristretto_path = output_spec + 10;
             if (*ristretto_path == '\0') {
                 fprintf(stderr, "Error: --output ristretto: requires a path, "
@@ -446,8 +470,8 @@ int main(int argc, char* argv[]) {
             return 1;
 #endif
         } else {
-            fprintf(stderr, "Error: unknown --output sink '%s' "
-                            "(use '-', 'stdout', or 'ristretto:<path>')\n",
+            fprintf(stderr, "Error: unknown --output sink '%s' (use '-', 'stdout', "
+                            "'ristretto:<path>', or 'ristretto-flow:<path>')\n",
                     output_spec);
             return 1;
         }
@@ -551,6 +575,16 @@ int main(int argc, char* argv[]) {
             if (filter_bytecode) free(filter_bytecode);
             return 1;
         }
+    } else if (ristretto_flow_path) {
+        ctx.flow_output = pcv_flow_output_create(ristretto_flow_path);
+        if (!ctx.flow_output) {
+            fprintf(stderr, "Error: Cannot open RistrettoDB flow output '%s'\n",
+                    ristretto_flow_path);
+            pcv_close(g_handle);
+            if (filter) pcv_filter_destroy(filter);
+            if (filter_bytecode) free(filter_bytecode);
+            return 1;
+        }
     }
 #endif
 
@@ -594,6 +628,17 @@ int main(int argc, char* argv[]) {
         printf("  RistrettoDB rows:   %" PRIu64 " (packets written to table)\n", rows);
         pcv_output_destroy(ctx.output);
         ctx.output = NULL;
+    }
+    /* Per-flow sink: the final row count is only known after destroy flushes
+     * every still-open flow, so report packets aggregated here and let destroy
+     * print the authoritative flow-row total. */
+    if (ctx.flow_output) {
+        uint64_t rows = 0, pkts = 0, bytes = 0;
+        pcv_flow_output_get_stats(ctx.flow_output, &rows, &pkts, &bytes);
+        printf("  RistrettoDB flows:  aggregated %" PRIu64 " packets into flows "
+               "(row count reported on close)\n", pkts);
+        pcv_flow_output_destroy(ctx.flow_output);
+        ctx.flow_output = NULL;
     }
 #endif
 
