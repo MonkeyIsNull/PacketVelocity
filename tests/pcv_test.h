@@ -180,4 +180,49 @@ static size_t pcv_build_ipv6_frame(uint8_t* buf, size_t buf_size,
     return total;
 }
 
+/* Build an Ethernet + ARP (IPv4-over-Ethernet) frame into buf.
+ * opcode is 1 (request) or 2 (reply); sender_ip/target_ip are host-order IPv4.
+ * sender_mac/target_mac are 6-byte MACs (target_mac may be NULL -> all zero,
+ * as in a who-has request). Produces a standard 42-byte ARP frame.
+ * Returns the total frame length in bytes (0 if it would not fit).
+ */
+static size_t pcv_build_arp_frame(uint8_t* buf, size_t buf_size,
+                                  uint16_t opcode,
+                                  uint32_t sender_ip, uint32_t target_ip,
+                                  const uint8_t sender_mac[6],
+                                  const uint8_t target_mac[6]) {
+    const size_t eth_len = 14;
+    const size_t arp_len = 28;           /* ARP IPv4-over-Ethernet payload */
+    size_t total = eth_len + arp_len;    /* 42 bytes */
+    if (total > buf_size) return 0;
+    memset(buf, 0, total);
+
+    /* Ethernet: dst MAC, src MAC, ethertype 0x0806 (ARP) */
+    static const uint8_t bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    memcpy(buf + 0, (opcode == 1 || target_mac == NULL) ? bcast : target_mac, 6);
+    memcpy(buf + 6, sender_mac, 6);
+    buf[12] = 0x08;
+    buf[13] = 0x06;
+
+    /* ARP payload */
+    uint8_t* arp = buf + eth_len;
+    arp[0] = 0x00; arp[1] = 0x01;        /* HTYPE: Ethernet */
+    arp[2] = 0x08; arp[3] = 0x00;        /* PTYPE: IPv4 */
+    arp[4] = 6;                          /* HLEN */
+    arp[5] = 4;                          /* PLEN */
+    arp[6] = (uint8_t)(opcode >> 8);     /* OPER */
+    arp[7] = (uint8_t)(opcode & 0xFF);
+
+    memcpy(arp + 8, sender_mac, 6);      /* SHA: sender MAC */
+    uint32_t spa = htonl(sender_ip);
+    memcpy(arp + 14, &spa, 4);           /* SPA: sender IPv4 */
+    if (target_mac != NULL) {
+        memcpy(arp + 18, target_mac, 6); /* THA: target MAC (0 in a request) */
+    }
+    uint32_t tpa = htonl(target_ip);
+    memcpy(arp + 24, &tpa, 4);           /* TPA: target IPv4 */
+
+    return total;
+}
+
 #endif /* PCV_TEST_H */
