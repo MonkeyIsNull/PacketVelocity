@@ -178,6 +178,8 @@ static uint8_t gr_dns[512];
 static uint32_t gr_dnslen;
 static uint8_t gr_flow[128];
 static uint32_t gr_flowlen;
+static uint8_t gr_tls[512];
+static uint32_t gr_tlslen;
 
 static int gr_stub(const pcv_resolve_key* k, char* out, size_t n, void* c) {
     (void)k; (void)c;
@@ -193,8 +195,13 @@ static void* gr_writer(void* arg) {
         pcv_packet p;
         memset(&p, 0, sizeof(p));
         p.timestamp_ns = base + (uint64_t)i * 1000000ULL;
-        if (i & 1) { p.data = gr_dns;  p.captured_length = gr_dnslen;  p.length = gr_dnslen; }
-        else       { p.data = gr_flow; p.captured_length = gr_flowlen; p.length = gr_flowlen; }
+        /* Interleave DNS, TLS and plain-flow packets through the SAME ring so
+         * the kind-dispatch + slot->flow producer/consumer handoff is raced. */
+        switch (i % 3) {
+        case 0:  p.data = gr_flow; p.captured_length = gr_flowlen; p.length = gr_flowlen; break;
+        case 1:  p.data = gr_dns;  p.captured_length = gr_dnslen;  p.length = gr_dnslen;  break;
+        default: p.data = gr_tls;  p.captured_length = gr_tlslen;  p.length = gr_tlslen;  break;
+        }
         pcv_dash_on_packet(gr_agg, &p);
         if ((i % 1000) == 0) pcv_dash_force_snapshot(gr_agg);
     }
@@ -212,6 +219,16 @@ static void* gr_reader(void* arg) {
         pcv_resolve_key_make(PCV_ADDR_IPV4, nb, &k);
         char nm[256];
         pcv_resolve_lookup(gr_resolver, &k, nm, sizeof(nm));
+        /* Race pcv_resolve_flow_sni (side-map copy-out) against the resolver
+         * thread inserting TLS slots into that same side map. */
+        pcv_flow_key_v6 fk;
+        memset(&fk, 0, sizeof(fk));
+        fk.addr_family = PCV_ADDR_IPV4;
+        fk.src_ip.ipv4 = htonl(0x0A000001u);
+        fk.dst_ip.ipv4 = htonl(0x08080808u);
+        fk.src_port = 50000; fk.dst_port = 443; fk.protocol = 6;
+        char sni[256]; int sis = 0;
+        pcv_resolve_flow_sni(gr_resolver, &fk, sni, sizeof(sni), &sis);
     }
     return NULL;
 }
@@ -236,6 +253,10 @@ static void test_tsan_resolver(void) {
                                                 0x0A000001u, 0x08080808u,
                                                 1234, 443, 0x10, 20);
     CHECK(gr_flowlen > 0, "build flow stress frame");
+    gr_tlslen = (uint32_t)pcv_build_tls_clienthello_ipv4(gr_tls, sizeof(gr_tls),
+                                                         0x0A000001u, 0x08080808u,
+                                                         50000, 443, "stress.example");
+    CHECK(gr_tlslen > 0, "build TLS ClientHello stress frame");
     atomic_store(&gr_writer_done, 0);
 
     pthread_t rt, wt, res;

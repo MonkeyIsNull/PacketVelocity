@@ -403,4 +403,158 @@ static size_t __attribute__((unused)) pcv_build_dns_ipv6(uint8_t* buf, size_t bu
     return total;
 }
 
+/* ---- TLS ClientHello builders ------------------------------------------- */
+
+/* Encode a TLS ClientHello RECORD (the TCP payload pcv_tls_parse_sni consumes)
+ * into out: a 5-byte TLS record header (handshake 0x16, version 0x0301) wrapping
+ * a ClientHello (handshake type `hs_type`, normally 0x01) with legacy_version
+ * 0x0303, a 32-byte random, an empty session_id, one cipher suite (0x1301), a
+ * null compression method, and an extensions block containing ONE server_name
+ * (type 0x0000) extension carrying `sni` as a host_name entry. When sni is NULL
+ * or empty, NO server_name extension is emitted (an empty extensions block).
+ * `hs_type` lets a test build a ServerHello (0x02) false-positive. Returns the
+ * record length, or 0 on overflow. */
+static size_t __attribute__((unused)) pcv_build_tls_clienthello(
+        uint8_t* out, size_t out_size, const char* sni, uint8_t hs_type) {
+    size_t sni_len = sni ? strlen(sni) : 0;
+    if (sni_len > 0xFFFF) return 0;
+
+    /* --- extensions block --- */
+    uint8_t exts[600];
+    size_t e = 0;
+    if (sni_len > 0) {
+        /* server_name extension: type 0x0000, then ext body. */
+        size_t host_entry = 3 + sni_len;             /* type(1)+len(2)+host */
+        size_t list_len   = host_entry;              /* server_name_list */
+        size_t ext_body   = 2 + list_len;            /* list length(2)+list */
+        if (ext_body + 4 > sizeof(exts)) return 0;
+        exts[e++] = 0x00; exts[e++] = 0x00;          /* ext type: server_name */
+        exts[e++] = (uint8_t)(ext_body >> 8); exts[e++] = (uint8_t)(ext_body & 0xFF);
+        exts[e++] = (uint8_t)(list_len >> 8); exts[e++] = (uint8_t)(list_len & 0xFF);
+        exts[e++] = 0x00;                            /* name type: host_name */
+        exts[e++] = (uint8_t)(sni_len >> 8); exts[e++] = (uint8_t)(sni_len & 0xFF);
+        memcpy(exts + e, sni, sni_len); e += sni_len;
+    }
+
+    /* --- ClientHello body --- */
+    uint8_t body[768];
+    size_t o = 0;
+    body[o++] = 0x03; body[o++] = 0x03;              /* legacy_version TLS 1.2 */
+    memset(body + o, 0xAB, 32); o += 32;             /* random */
+    body[o++] = 0x00;                                /* session_id length 0 */
+    body[o++] = 0x00; body[o++] = 0x02;              /* cipher_suites length 2 */
+    body[o++] = 0x13; body[o++] = 0x01;              /* TLS_AES_128_GCM_SHA256 */
+    body[o++] = 0x01;                                /* compression methods len */
+    body[o++] = 0x00;                                /* null compression */
+    body[o++] = (uint8_t)(e >> 8); body[o++] = (uint8_t)(e & 0xFF); /* ext total */
+    if (o + e > sizeof(body)) return 0;
+    memcpy(body + o, exts, e); o += e;
+
+    /* --- handshake header (type + 24-bit length) --- */
+    size_t hs_len = o;
+    size_t rec_len = 4 + hs_len;
+    size_t total = 5 + rec_len;
+    if (total > out_size) return 0;
+
+    out[0] = 0x16;                                   /* content type: handshake */
+    out[1] = 0x03; out[2] = 0x01;                    /* record version TLS 1.0 */
+    out[3] = (uint8_t)(rec_len >> 8); out[4] = (uint8_t)(rec_len & 0xFF);
+    out[5] = hs_type;                                /* handshake type */
+    out[6] = (uint8_t)(hs_len >> 16);
+    out[7] = (uint8_t)(hs_len >> 8);
+    out[8] = (uint8_t)(hs_len & 0xFF);
+    memcpy(out + 9, body, hs_len);
+    return total;
+}
+
+/* Build Eth+IPv4+TCP carrying a raw TLS record (`rec`,`rec_len`) as the TCP
+ * payload. TCP data offset is 5 (20-byte header). src_ip/dst_ip are host-order
+ * IPv4; sport/dport are the TCP ports. Returns the total frame length (0 on
+ * overflow). */
+static size_t __attribute__((unused)) pcv_build_tls_raw_ipv4(
+        uint8_t* buf, size_t buf_size, uint32_t src_ip, uint32_t dst_ip,
+        uint16_t sport, uint16_t dport, const uint8_t* rec, size_t rec_len) {
+    const size_t eth = 14, ip = 20, tcp = 20;
+    size_t total = eth + ip + tcp + rec_len;
+    if (total > buf_size) return 0;
+    memset(buf, 0, total);
+
+    static const uint8_t dmac[6] = {0x02,0,0,0,0,0x01};
+    static const uint8_t smac[6] = {0x02,0,0,0,0,0x02};
+    memcpy(buf, dmac, 6); memcpy(buf + 6, smac, 6);
+    buf[12] = 0x08; buf[13] = 0x00;
+
+    uint8_t* iph = buf + eth;
+    iph[0] = 0x45;
+    uint16_t iptot = (uint16_t)(ip + tcp + rec_len);
+    iph[2] = (uint8_t)(iptot >> 8); iph[3] = (uint8_t)(iptot & 0xFF);
+    iph[8] = 64; iph[9] = 6;                         /* TTL, proto TCP */
+    uint32_t s = htonl(src_ip), d = htonl(dst_ip);
+    memcpy(iph + 12, &s, 4); memcpy(iph + 16, &d, 4);
+
+    uint8_t* t = iph + ip;
+    uint16_t sp = htons(sport), dp = htons(dport);
+    memcpy(t, &sp, 2); memcpy(t + 2, &dp, 2);
+    t[12] = 0x50;                                    /* data offset 5 (20 bytes) */
+    t[13] = 0x18;                                    /* PSH|ACK */
+    if (rec_len && rec) memcpy(t + tcp, rec, rec_len);
+    return total;
+}
+
+/* Build Eth+IPv6+TCP carrying a raw TLS record. src_ip6/dst_ip6 are 16-byte
+ * network-order addresses. Returns the total frame length (0 on overflow). */
+static size_t __attribute__((unused)) pcv_build_tls_raw_ipv6(
+        uint8_t* buf, size_t buf_size, const uint8_t src_ip6[16],
+        const uint8_t dst_ip6[16], uint16_t sport, uint16_t dport,
+        const uint8_t* rec, size_t rec_len) {
+    const size_t eth = 14, ip6 = 40, tcp = 20;
+    size_t total = eth + ip6 + tcp + rec_len;
+    if (total > buf_size) return 0;
+    memset(buf, 0, total);
+
+    static const uint8_t dmac[6] = {0x02,0,0,0,0,0x01};
+    static const uint8_t smac[6] = {0x02,0,0,0,0,0x02};
+    memcpy(buf, dmac, 6); memcpy(buf + 6, smac, 6);
+    buf[12] = 0x86; buf[13] = 0xDD;
+
+    uint8_t* iph = buf + eth;
+    iph[0] = 0x60;
+    uint16_t plen = (uint16_t)(tcp + rec_len);
+    iph[4] = (uint8_t)(plen >> 8); iph[5] = (uint8_t)(plen & 0xFF);
+    iph[6] = 6; iph[7] = 64;                          /* next header TCP, hop lim */
+    memcpy(iph + 8, src_ip6, 16); memcpy(iph + 24, dst_ip6, 16);
+
+    uint8_t* t = iph + ip6;
+    uint16_t sp = htons(sport), dp = htons(dport);
+    memcpy(t, &sp, 2); memcpy(t + 2, &dp, 2);
+    t[12] = 0x50;                                     /* data offset 5 */
+    t[13] = 0x18;                                     /* PSH|ACK */
+    if (rec_len && rec) memcpy(t + tcp, rec, rec_len);
+    return total;
+}
+
+/* Convenience: Eth+IPv4+TCP ClientHello with the given SNI (handshake type 1).
+ * Returns the total frame length (0 on overflow). */
+static size_t __attribute__((unused)) pcv_build_tls_clienthello_ipv4(
+        uint8_t* buf, size_t buf_size, uint32_t src_ip, uint32_t dst_ip,
+        uint16_t sport, uint16_t dport, const char* sni) {
+    uint8_t rec[900];
+    size_t rl = pcv_build_tls_clienthello(rec, sizeof(rec), sni, 0x01);
+    if (rl == 0) return 0;
+    return pcv_build_tls_raw_ipv4(buf, buf_size, src_ip, dst_ip, sport, dport,
+                                  rec, rl);
+}
+
+/* Convenience: Eth+IPv6+TCP ClientHello with the given SNI (handshake type 1). */
+static size_t __attribute__((unused)) pcv_build_tls_clienthello_ipv6(
+        uint8_t* buf, size_t buf_size, const uint8_t src_ip6[16],
+        const uint8_t dst_ip6[16], uint16_t sport, uint16_t dport,
+        const char* sni) {
+    uint8_t rec[900];
+    size_t rl = pcv_build_tls_clienthello(rec, sizeof(rec), sni, 0x01);
+    if (rl == 0) return 0;
+    return pcv_build_tls_raw_ipv6(buf, buf_size, src_ip6, dst_ip6, sport, dport,
+                                  rec, rl);
+}
+
 #endif /* PCV_TEST_H */

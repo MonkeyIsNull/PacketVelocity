@@ -58,12 +58,24 @@ typedef struct {
     } a;
 } pcv_resolve_key;
 
-/* Name-source provenance stored per map entry. */
+/* Name-source provenance stored per map entry. NOTE the RAW enum values are NOT
+ * in precedence order (PTR=2 > PASSIVE=1 numerically, yet PASSIVE must outrank
+ * PTR); the IP->name map orders by an internal rank() helper, not these values.
+ * Precedence strongest-to-weakest is SNI > PASSIVE > PTR:
+ *   - SNI is the EXACT hostname the browser requested on that connection
+ *     (intent-revealing, and immune to the encrypted-DNS gap SNI exists to fix);
+ *   - PASSIVE is a real resolved name but keyed only by IP (may be a CNAME end);
+ *   - PTR is infra (1e100.net / cloudfront.net, or blank for Fastly). */
 typedef enum {
     PCV_NAME_NONE    = 0,
-    PCV_NAME_PASSIVE = 1,   /* from a DNS/mDNS answer (authoritative-ish, best) */
-    PCV_NAME_PTR     = 2    /* from a reverse-PTR fallback lookup */
+    PCV_NAME_PASSIVE = 1,   /* from a DNS/mDNS answer (authoritative-ish) */
+    PCV_NAME_PTR     = 2,   /* from a reverse-PTR fallback lookup */
+    PCV_NAME_SNI     = 3    /* from a TLS ClientHello server_name (exact intent) */
 } pcv_name_source;
+
+/* Forward declaration so the flow->SNI lookup can take a flow key without this
+ * header depending on pcv_flow.h (the resolver TU and dashboard TU include it). */
+struct pcv_flow_key_v6;
 
 /* Reverse-PTR seam ("swap the source", mirroring netdebug lookupAddrFunc). Must
  * write a NUL-terminated name into out (<= outlen) and return 0 on success, or
@@ -119,6 +131,33 @@ void pcv_resolve_key_make(uint8_t family, const void* addr, pcv_resolve_key* out
  * multicast / unspecified (mirrors netdebug isGlobalIP). addr is 4 or 16
  * network-order bytes per family. Only global IPs are eligible for a PTR. */
 bool pcv_is_global_ip(uint8_t family, const void* addr);
+
+/* The hardened, pure TLS ClientHello -> SNI parser over ONLY b[0..len). Fully
+ * bounds-checked at EVERY step against the captured bytes (the 5-byte record
+ * header + record length, the ClientHello 24-bit length, legacy_version/random/
+ * session_id/cipher_suites/compression_methods, then the extensions walk to
+ * server_name (type 0x0000) -> host_name entry). Self-contained and safe for ANY
+ * len (does NOT rely on any drain-time clamp). On success copies the hostname
+ * (NUL-terminated, capped at 255 and at outcap-1) into out and returns 0; on any
+ * shortfall / truncation / malformation returns -1 (out[0] set to '\0'), never
+ * overreading and never blocking. A ClientHello whose SNI falls past the
+ * captured prefix (snaplen truncation or TCP-segment spanning) simply parses to
+ * "not found" (-1) this cycle - no reassembly in the MVP. */
+int pcv_tls_parse_sni(const uint8_t* b, uint32_t len, char* out, size_t outcap);
+
+/* Flow->SNI lookup for the serializer (HTTP thread). The resolver owns a bounded
+ * per-flow (5-tuple) SNI side map (the capture thread owns the flow table and
+ * the resolver cannot mutate it, so a side map read at serialize time is the
+ * only safe shape). A TCP connection yields TWO flow rows - forward
+ * {client->server:443} and reverse {server:443->client}; the ClientHello keys
+ * only the forward tuple, so this tries BOTH orientations: a DIRECT match means
+ * the SNI names rowkey's dst (*server_is_src=0); otherwise the src/dst+port
+ * swapped twin is tried and a hit names rowkey's src (*server_is_src=1). Copies
+ * the name into buf (clamped to len-1, NUL-terminated) under names_mtx and
+ * returns its length (0 on miss / NULL args). Refreshes the hit on read so a
+ * long-lived bulk-download flow stays named. */
+size_t pcv_resolve_flow_sni(pcv_resolver* r, const struct pcv_flow_key_v6* rowkey,
+                            char* buf, size_t len, int* server_is_src);
 
 /* The hardened, pure DNS/mDNS message parser over ONLY payload[0..len). Requires
  * QR=1 and ancount>0; skips the question section and walks exactly ancount
