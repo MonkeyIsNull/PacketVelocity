@@ -45,6 +45,7 @@
 #define PCV_NAME_MAX            256u   /* name buffer incl. NUL (255-byte cap) */
 #define PCV_RESOLVE_MAP_CAP     4096u  /* fixed open-addressed IP->name table */
 #define PCV_RESOLVE_NEG_CAP     1024u  /* fixed open-addressed negative cache */
+#define PCV_RESOLVE_SNI_CAP     2048u  /* fixed open-addressed flow->SNI map */
 #define PCV_DNS_MAX_JUMPS       16     /* hard compression-pointer indirection cap */
 #define PCV_RESOLVE_PTR_PER_CYCLE 8    /* K: max reverse lookups per PTR pass */
 
@@ -72,12 +73,23 @@ typedef struct {
     uint64_t insert_ns;            /* TTL (== cooldown) + LRU reclaim */
 } neg_entry;
 
+/* Per-flow SNI side map entry: keyed by the EXACT 5-tuple the ClientHello was
+ * captured on (client->server:443), carrying the sanitized server_name. */
+typedef struct {
+    uint8_t         used;          /* 0 empty, 1 occupied */
+    uint8_t         _pad[7];
+    pcv_flow_key_v6 key;           /* the ClientHello's forward 5-tuple */
+    uint64_t        insert_ns;     /* TTL + LRU reclaim (refreshed on read) */
+    char            name[PCV_NAME_MAX];
+} sni_entry;
+
 struct pcv_resolver {
     struct pcv_dash_agg* agg;      /* ring source + flow-snapshot source */
 
-    pthread_mutex_t names_mtx;     /* guards map[] AND neg[] */
+    pthread_mutex_t names_mtx;     /* guards map[], neg[] AND sni[] */
     name_entry* map;               /* PCV_RESOLVE_MAP_CAP entries */
     neg_entry*  neg;               /* PCV_RESOLVE_NEG_CAP entries */
+    sni_entry*  sni;               /* PCV_RESOLVE_SNI_CAP entries (flow->SNI) */
 
     pcv_ptr_fn ptr_fn;             /* injectable reverse-PTR seam */
     void*      ptr_ctx;
@@ -172,6 +184,20 @@ static size_t sanitize_name(const char* in, char* out, size_t outcap) {
     return o;
 }
 
+/* ---- Provenance precedence ----------------------------------------------- */
+
+/* Map a name source to its precedence rank. The enum's RAW values are not in
+ * rank order (PTR=2 > PASSIVE=1), so ordering MUST go through this helper.
+ * Strongest to weakest: SNI(3) > PASSIVE(2) > PTR(1) > NONE(0). */
+static int name_rank(uint8_t source) {
+    switch (source) {
+    case PCV_NAME_SNI:     return 3;
+    case PCV_NAME_PASSIVE: return 2;
+    case PCV_NAME_PTR:     return 1;
+    default:               return 0;
+    }
+}
+
 /* ---- Map operations (caller holds names_mtx) ----------------------------- */
 
 static name_entry* map_find(pcv_resolver* r, uint8_t family, const void* addr,
@@ -223,9 +249,13 @@ static void map_insert(pcv_resolver* r, uint8_t family, const void* addr,
             ((family == PCV_ADDR_IPV4) ? (memcmp(&e->a.v4, addr, 4) == 0)
                                        : (memcmp(e->a.v6, addr, 16) == 0))) {
             int expired = (now - e->insert_ns > PCV_NAME_POS_TTL_NS);
-            /* Provenance: a PTR insert must not clobber a live PASSIVE name. */
-            if (!expired && source == PCV_NAME_PTR &&
-                e->source == PCV_NAME_PASSIVE) {
+            /* Provenance precedence SNI > PASSIVE > PTR: replace a LIVE entry
+             * only when the new source ranks >= the existing (same-rank is
+             * last-writer-wins refresh). So PTR never clobbers live SNI/PASSIVE,
+             * PASSIVE never clobbers live SNI, and SNI overwrites anything. An
+             * EXPIRED entry of any rank stays replaceable (the !expired escape),
+             * so a stale SNI/PASSIVE cannot forever block a fresh PTR. */
+            if (!expired && name_rank(source) < name_rank(e->source)) {
                 return;
             }
             e->source = source;
@@ -334,6 +364,130 @@ static void neg_insert(pcv_resolver* r, uint8_t family, const void* addr,
     } else {
         memcpy(e->a.v6, addr, 16);
     }
+}
+
+/* ---- Flow->SNI side map (caller holds names_mtx) -------------------------
+ * A bounded open-addressed table keyed by the EXACT 5-tuple a ClientHello was
+ * captured on, hashed/compared with the SAME directional functions the flow
+ * table uses (pcv_flow_hash_key_v6 + pcv_flow_key_v6_compare, no
+ * canonicalization), so a side-map key matches a flow row's key6 byte-for-byte.
+ * TTL + whole-table-LRU reclaim mirror map_insert, so memory is strictly
+ * bounded (PCV_RESOLVE_SNI_CAP entries, never grows). */
+
+static sni_entry* sni_find(pcv_resolver* r, const pcv_flow_key_v6* key,
+                           uint64_t now) {
+    uint32_t start = pcv_flow_hash_key_v6(key) % PCV_RESOLVE_SNI_CAP;
+    for (uint32_t i = 0; i < PCV_RESOLVE_SNI_CAP; i++) {
+        uint32_t idx = (start + i) % PCV_RESOLVE_SNI_CAP;
+        sni_entry* e = &r->sni[idx];
+        if (!e->used) {
+            return NULL;                       /* open slot ends the probe run */
+        }
+        if (pcv_flow_key_v6_compare(&e->key, key) == 0) {
+            if (now - e->insert_ns > PCV_NAME_POS_TTL_NS) {
+                return NULL;                   /* expired: treat as absent */
+            }
+            return e;
+        }
+    }
+    return NULL;
+}
+
+static void sni_insert(pcv_resolver* r, const pcv_flow_key_v6* key,
+                       const char* sani, uint64_t now) {
+    uint32_t start = pcv_flow_hash_key_v6(key) % PCV_RESOLVE_SNI_CAP;
+    uint32_t first_free = UINT32_MAX;
+
+    for (uint32_t i = 0; i < PCV_RESOLVE_SNI_CAP; i++) {
+        uint32_t idx = (start + i) % PCV_RESOLVE_SNI_CAP;
+        sni_entry* e = &r->sni[idx];
+        if (!e->used) {
+            if (first_free == UINT32_MAX) {
+                first_free = idx;
+            }
+            break;                             /* open slot ends this key's run */
+        }
+        if (pcv_flow_key_v6_compare(&e->key, key) == 0) {
+            e->insert_ns = now;
+            strncpy(e->name, sani, PCV_NAME_MAX - 1);
+            e->name[PCV_NAME_MAX - 1] = '\0';
+            return;
+        }
+    }
+
+    uint32_t dst;
+    if (first_free != UINT32_MAX) {
+        dst = first_free;
+    } else {
+        /* No free slot: reclaim the globally-oldest entry (bounded, no growth).*/
+        uint64_t oldest_ns = UINT64_MAX;
+        uint32_t oldest_idx = 0;
+        for (uint32_t i = 0; i < PCV_RESOLVE_SNI_CAP; i++) {
+            if (r->sni[i].insert_ns < oldest_ns) {
+                oldest_ns = r->sni[i].insert_ns;
+                oldest_idx = i;
+            }
+        }
+        dst = oldest_idx;
+    }
+
+    sni_entry* e = &r->sni[dst];
+    memset(e, 0, sizeof(*e));
+    e->used = 1;
+    e->key = *key;
+    e->insert_ns = now;
+    strncpy(e->name, sani, PCV_NAME_MAX - 1);
+    e->name[PCV_NAME_MAX - 1] = '\0';
+}
+
+size_t pcv_resolve_flow_sni(pcv_resolver* r, const struct pcv_flow_key_v6* rowkey,
+                            char* buf, size_t len, int* server_is_src) {
+    if (server_is_src) {
+        *server_is_src = 0;
+    }
+    if (!buf || len == 0) {
+        return 0;
+    }
+    buf[0] = '\0';
+    if (!r || !rowkey) {
+        return 0;
+    }
+    const pcv_flow_key_v6* key = (const pcv_flow_key_v6*)rowkey;
+    uint64_t now = res_now_ns();
+
+    size_t out = 0;
+    pthread_mutex_lock(&r->names_mtx);
+
+    int src_side = 0;
+    sni_entry* e = sni_find(r, key, now);    /* DIRECT: SNI names rowkey.dst */
+    if (!e) {
+        /* Build the src/dst + port swapped twin (the reverse-direction row's
+         * forward tuple) and try that: a hit means the SNI names rowkey.src. */
+        pcv_flow_key_v6 twin = *key;
+        twin.src_ip   = key->dst_ip;
+        twin.dst_ip   = key->src_ip;
+        twin.src_port = key->dst_port;
+        twin.dst_port = key->src_port;
+        e = sni_find(r, &twin, now);
+        if (e) {
+            src_side = 1;
+        }
+    }
+    if (e) {
+        e->insert_ns = now;                  /* refresh-on-read (resolver owns) */
+        size_t nl = strlen(e->name);
+        if (nl >= len) {
+            nl = len - 1;
+        }
+        memcpy(buf, e->name, nl);
+        buf[nl] = '\0';
+        out = nl;
+        if (server_is_src) {
+            *server_is_src = src_side;
+        }
+    }
+    pthread_mutex_unlock(&r->names_mtx);
+    return out;
 }
 
 /* ---- HTTP-thread read path ----------------------------------------------- */
@@ -505,6 +659,145 @@ int pcv_dns_parse(const uint8_t* msg, uint32_t len, pcv_dns_emit_fn emit,
     return 0;
 }
 
+/* ---- Hardened TLS ClientHello -> SNI parser ------------------------------
+ * Self-contained and memory-safe for ANY len (tests drive it over tight
+ * malloc(len) buffers under ASan, so it MUST NOT rely on any drain-time clamp).
+ * A single cursor p and a bound `end` are advanced; end starts at the captured
+ * length and is only ever CLAMPED DOWN (record_len, then hs_len, then
+ * ext_total), never past len. The invariant p <= end is maintained at every
+ * advance, so the subtraction-form need check (end - p) >= n never underflows.
+ * server_name is additionally bounded by the extension's own ext_end, so a
+ * hostile small elen cannot read a neighbouring extension. Any shortfall at any
+ * step returns -1 (not found); never overreads, never blocks. */
+int pcv_tls_parse_sni(const uint8_t* b, uint32_t len, char* out, size_t outcap) {
+    if (!b || !out || outcap == 0) {
+        return -1;
+    }
+    out[0] = '\0';
+
+    /* (1) TLS record header. Re-assert the content type even though the hot
+     * gate checked it (the SPSC ring is a trust boundary). */
+    if (len < 5u || b[0] != 0x16) {
+        return -1;
+    }
+    uint32_t record_len = ((uint32_t)b[3] << 8) | (uint32_t)b[4];
+    uint32_t end = len;
+    if ((uint64_t)5u + (uint64_t)record_len < (uint64_t)end) {
+        end = 5u + record_len;
+    }
+    uint32_t p = 5u;
+
+/* Needed-bytes check in subtraction form; valid ONLY while (pp) <= end holds. */
+#define NEED(pp, nn) (((uint32_t)((end) - (pp))) >= (uint32_t)(nn))
+
+    /* (2) ClientHello header: type(1) + 24-bit length(3). */
+    if (!NEED(p, 4)) {
+        return -1;
+    }
+    if (b[5] != 0x01) {                        /* re-assert ClientHello */
+        return -1;
+    }
+    uint32_t hs_len = ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 8) | (uint32_t)b[8];
+    if ((uint64_t)9u + (uint64_t)hs_len < (uint64_t)end) {
+        end = 9u + hs_len;
+    }
+    p = 9u;
+
+    /* (3) legacy_version(2) + random(32) = 34 bytes. */
+    if (!NEED(p, 34)) {
+        return -1;
+    }
+    p += 34u;
+
+    /* (4) session_id (1-byte length prefix). */
+    if (!NEED(p, 1)) {
+        return -1;
+    }
+    uint32_t sid = b[p];
+    p += 1u;
+    if (!NEED(p, sid)) {
+        return -1;
+    }
+    p += sid;
+
+    /* (5) cipher_suites (2-byte length prefix). */
+    if (!NEED(p, 2)) {
+        return -1;
+    }
+    uint32_t cs = ((uint32_t)b[p] << 8) | (uint32_t)b[p + 1];
+    p += 2u;
+    if (!NEED(p, cs)) {
+        return -1;
+    }
+    p += cs;
+
+    /* (6) compression_methods (1-byte length prefix). */
+    if (!NEED(p, 1)) {
+        return -1;
+    }
+    uint32_t cm = b[p];
+    p += 1u;
+    if (!NEED(p, cm)) {
+        return -1;
+    }
+    p += cm;
+
+    /* (7) extensions block (2-byte total length); clamp end down to its span. */
+    if (!NEED(p, 2)) {
+        return -1;
+    }
+    uint32_t ext_total = ((uint32_t)b[p] << 8) | (uint32_t)b[p + 1];
+    p += 2u;
+    if ((uint64_t)p + (uint64_t)ext_total < (uint64_t)end) {
+        end = p + ext_total;
+    }
+
+    /* (8) walk extensions; advance p by 4 UNCONDITIONALLY so progress is
+     * guaranteed (elen==0 is legal). */
+    while (NEED(p, 4)) {
+        uint32_t etype = ((uint32_t)b[p] << 8) | (uint32_t)b[p + 1];
+        uint32_t elen  = ((uint32_t)b[p + 2] << 8) | (uint32_t)b[p + 3];
+        p += 4u;
+        if (!NEED(p, elen)) {
+            return -1;                         /* elen past end: reject */
+        }
+        uint32_t ext_end = p + elen;           /* bound for THIS extension body */
+
+        if (etype != 0x0000u) {
+            p = ext_end;                        /* skip non-server_name ext */
+            continue;
+        }
+
+        /* (9) server_name extension, bounded strictly by ext_end (NOT end). */
+        if ((uint32_t)(ext_end - p) < 2u) {    /* server_name_list length(2) */
+            return -1;
+        }
+        p += 2u;                                /* list length; value unused */
+        if ((uint32_t)(ext_end - p) < 3u) {    /* entry: type(1)+name_len(2) */
+            return -1;
+        }
+        uint32_t nametype = b[p];
+        uint32_t name_len = ((uint32_t)b[p + 1] << 8) | (uint32_t)b[p + 2];
+        p += 3u;
+        if (nametype != 0u) {                   /* host_name only */
+            return -1;
+        }
+        /* TWO independent bounds: source (within the extension) AND dest. */
+        if ((uint32_t)(ext_end - p) < name_len) {
+            return -1;
+        }
+        if (!(name_len <= outcap - 1u && name_len <= 255u)) {
+            return -1;                          /* never truncate: reject */
+        }
+        memcpy(out, b + p, name_len);
+        out[name_len] = '\0';
+        return 0;
+    }
+
+#undef NEED
+    return -1;                                  /* no server_name found */
+}
+
 /* ---- Passive-DNS drain --------------------------------------------------- */
 
 /* emit context: the resolver + a timestamp, so the emit callback can sanitize
@@ -548,8 +841,35 @@ void pcv_resolver_drain_once(pcv_resolver* r) {
         if (slen > PCV_DNS_SLOT_BYTES) {
             slen = PCV_DNS_SLOT_BYTES;         /* defensive clamp */
         }
-        /* Parser reads ONLY slot->bytes[0..slen); never the slot constant. */
-        pcv_dns_parse(slot->bytes, slen, passive_emit, &c);
+        /* Dispatch STRICTLY on the producer's kind tag so a slot reused across
+         * DNS/TLS enqueues never misfeeds a payload into the wrong parser. Each
+         * parser reads ONLY slot->bytes[0..slen); the DNS path never touches
+         * slot->flow. */
+        if (slot->kind == PCV_SLOT_TLS) {
+            char host[PCV_NAME_MAX];
+            if (pcv_tls_parse_sni(slot->bytes, slen, host, sizeof(host)) == 0) {
+                char sani[PCV_NAME_MAX];
+                if (sanitize_name(host, sani, sizeof(sani)) > 0) {
+                    /* (a) PRIMARY: the per-flow side map, keyed by the EXACT
+                     * captured 5-tuple (exact even on a shared CDN IP). */
+                    sni_insert(r, &slot->flow, sani, c.now);
+                    /* (b) FOLD: the IP->name map for the server IP (flow.dst),
+                     * source SNI, so the per-IP hosts panel + cross-flow reuse
+                     * get a name. Lossy on shared IPs (last-writer-wins) by
+                     * design; the flow row stays exact via the side map. */
+                    uint8_t fam = slot->flow.addr_family;
+                    if (fam == PCV_ADDR_IPV4) {
+                        map_insert(r, PCV_ADDR_IPV4, &slot->flow.dst_ip.ipv4,
+                                   sani, PCV_NAME_SNI, c.now);
+                    } else if (fam == PCV_ADDR_IPV6) {
+                        map_insert(r, PCV_ADDR_IPV6, slot->flow.dst_ip.ipv6,
+                                   sani, PCV_NAME_SNI, c.now);
+                    }
+                }
+            }
+        } else {
+            pcv_dns_parse(slot->bytes, slen, passive_emit, &c);
+        }
         head = (head + 1u) & PCV_DNS_RING_MASK;
     }
     pthread_mutex_unlock(&r->names_mtx);
@@ -704,9 +1024,11 @@ pcv_resolver* pcv_resolver_create(struct pcv_dash_agg* agg, pcv_ptr_fn fn,
     }
     r->map = calloc(PCV_RESOLVE_MAP_CAP, sizeof(name_entry));
     r->neg = calloc(PCV_RESOLVE_NEG_CAP, sizeof(neg_entry));
-    if (!r->map || !r->neg) {
+    r->sni = calloc(PCV_RESOLVE_SNI_CAP, sizeof(sni_entry));
+    if (!r->map || !r->neg || !r->sni) {
         free(r->map);
         free(r->neg);
+        free(r->sni);
         pthread_mutex_destroy(&r->names_mtx);
         free(r);
         return NULL;
@@ -726,6 +1048,7 @@ void pcv_resolver_destroy(pcv_resolver* r) {
     }
     free(r->map);
     free(r->neg);
+    free(r->sni);
     pthread_mutex_destroy(&r->names_mtx);
     free(r);
 }

@@ -31,8 +31,18 @@
 #define PCV_DNS_RING_SLOTS 64u      /* power of two; holds SLOTS-1 usable */
 #define PCV_DNS_RING_MASK  (PCV_DNS_RING_SLOTS - 1u)
 
+/* Slot kind tag: the same ring now carries BOTH passive-DNS UDP payloads and
+ * TLS ClientHello TCP-payload prefixes. The resolver dispatches on this tag so a
+ * slot physically reused from a prior TLS enqueue never misfeeds a DNS payload
+ * into the SNI parser (and vice versa). The DNS path NEVER reads slot->flow. */
+#define PCV_SLOT_DNS 0u
+#define PCV_SLOT_TLS 1u
+
 typedef struct {
     uint32_t len;                       /* copy_len actually stored (<= SLOT) */
+    uint8_t  kind;                      /* PCV_SLOT_DNS or PCV_SLOT_TLS */
+    uint8_t  _pad[3];
+    pcv_flow_key_v6 flow;               /* captured 5-tuple (TLS only; DNS=zero) */
     uint8_t  bytes[PCV_DNS_SLOT_BYTES];
 } pcv_dns_slot;
 

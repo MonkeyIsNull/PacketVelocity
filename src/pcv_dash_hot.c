@@ -144,13 +144,20 @@ static void dash_try_publish(struct pcv_dash_agg* agg) {
     }
 }
 
-/* ---- Passive-DNS enqueue (capture thread) -------------------------------
- * Copy a bounded UDP payload into the next SPSC ring slot with WAIT-FREE
+/* ---- Resolver-payload enqueue (capture thread) --------------------------
+ * Copy a bounded L4 payload prefix into the next SPSC ring slot with WAIT-FREE
  * atomics ONLY: no lock, no malloc, no syscall, no I/O. SINGLE-PRODUCER (the
  * capture thread). A full ring simply drops the copy and bumps dns_dropped -
- * names are best-effort and never allowed to stall capture. */
+ * names are best-effort and never allowed to stall capture.
+ *
+ * kind tags the slot (PCV_SLOT_DNS / PCV_SLOT_TLS) so the resolver dispatches
+ * the right parser. flowp carries the captured 5-tuple for TLS slots (so the
+ * resolver can key the per-flow SNI side map); the DNS caller passes NULL and
+ * the flow field is never written or read for a DNS slot. Ring room is checked
+ * FIRST, so a candidate arriving at a full ring pays no wasted slot write. */
 static void dns_ring_enqueue(struct pcv_dash_agg* agg, const uint8_t* payload,
-                             uint32_t copy_len) {
+                             uint32_t copy_len, uint8_t kind,
+                             const pcv_flow_key_v6* flowp) {
     if (copy_len == 0) {
         return;
     }
@@ -169,7 +176,12 @@ static void dns_ring_enqueue(struct pcv_dash_agg* agg, const uint8_t* payload,
     pcv_dns_slot* slot = &agg->dns_ring[tail];
     memcpy(slot->bytes, payload, copy_len);
     slot->len = copy_len;
-    /* Release so the slot bytes + len are visible to the consumer's acquire. */
+    slot->kind = kind;                            /* ALWAYS set (reused slots) */
+    if (kind == PCV_SLOT_TLS && flowp != NULL) {
+        slot->flow = *flowp;                      /* bounded struct copy */
+    }
+    /* Release so the slot bytes + len + kind + flow are visible to the
+     * consumer's matching acquire. */
     atomic_store_explicit(&agg->dns_tail, next, memory_order_release);
 }
 
@@ -192,33 +204,75 @@ void pcv_dash_on_packet(pcv_dash_agg* agg, const pcv_packet* packet) {
     /* 3. Feed the existing flow tracker (capture owns the table). */
     pcv_flow_update_v6(agg->flows, packet);
 
-    /* 3b. PASSIVE-DNS enqueue (only when --serve wired a resolver). A non-DNS
-     *     packet pays ONE extra branch (the family gate). dash_classify folds
-     *     ALL IPv6 into PCV_PROTO_IPV6 and never resolves L4, so we must enter
-     *     on k==UDP (IPv4 UDP) OR k==IPV6 (any IPv6, incl. the mDNS ff02::fb
-     *     traffic that is IPv6 on macOS), then confirm UDP via the shared,
-     *     bounds-checked offset walk. All parsing happens OFF this thread. */
+    /* 3b. RESOLVER enqueue (only when --serve wired a resolver). ONE shared,
+     *     bounds-checked L4-offset walk, then dispatch on the resolved L4
+     *     protocol: UDP(17) -> passive DNS, TCP(6) -> TLS ClientHello SNI.
+     *     dash_classify folds ALL IPv6 into PCV_PROTO_IPV6 and never resolves
+     *     L4, so we must enter on UDP (IPv4 UDP) OR TCP (IPv4 TCP) OR IPV6 (any
+     *     IPv6 flavor, incl. mDNS ff02::fb and IPv6-TCP HTTPS) to reach every
+     *     candidate, then resolve L4 exactly once. All parsing happens OFF this
+     *     thread; here we only do bounded byte reads + a bounded memcpy. */
     if (agg->resolver != NULL &&
-        (k == PCV_PROTO_UDP || k == PCV_PROTO_IPV6)) {
+        (k == PCV_PROTO_UDP || k == PCV_PROTO_TCP || k == PCV_PROTO_IPV6)) {
         uint32_t l4_off = 0;
         uint8_t  l4_proto = 0;
-        if (pcv_l4_header_offset(packet, &l4_off, &l4_proto) && l4_proto == 17) {
+        if (pcv_l4_header_offset(packet, &l4_off, &l4_proto)) {
             uint32_t caplen = packet->captured_length;
-            /* Underflow-SAFE: never form (caplen - 8); add on the l4_off side.
-             * pcv_l4_header_offset only guarantees l4_off <= caplen, so the UDP
-             * header (8 bytes) must be re-checked here before any read. */
-            if ((uint64_t)l4_off + 8u <= (uint64_t)caplen) {
-                const uint8_t* u = packet->data + l4_off;
-                uint16_t sport = (uint16_t)((u[0] << 8) | u[1]);
-                uint16_t dport = (uint16_t)((u[2] << 8) | u[3]);
-                /* Candidate RESPONSE: classic resolver reply (UDP src 53) OR
-                 * mDNS (5353 either direction). */
-                if (sport == 53u || sport == 5353u || dport == 5353u) {
-                    uint32_t payload_off = l4_off + 8u;
-                    uint32_t avail = caplen - payload_off;    /* safe: >= 0 */
-                    uint32_t copy_len = (avail < PCV_DNS_SLOT_BYTES)
-                                      ? avail : PCV_DNS_SLOT_BYTES;
-                    dns_ring_enqueue(agg, packet->data + payload_off, copy_len);
+            if (l4_proto == 17) {
+                /* ---- Passive DNS (unchanged behaviour) ----
+                 * Underflow-SAFE: never form (caplen - 8); add on the l4_off
+                 * side. pcv_l4_header_offset only guarantees l4_off <= caplen,
+                 * so the 8-byte UDP header must be re-checked before any read. */
+                if ((uint64_t)l4_off + 8u <= (uint64_t)caplen) {
+                    const uint8_t* u = packet->data + l4_off;
+                    uint16_t sport = (uint16_t)((u[0] << 8) | u[1]);
+                    uint16_t dport = (uint16_t)((u[2] << 8) | u[3]);
+                    /* Candidate RESPONSE: classic resolver reply (UDP src 53)
+                     * OR mDNS (5353 either direction). */
+                    if (sport == 53u || sport == 5353u || dport == 5353u) {
+                        uint32_t payload_off = l4_off + 8u;
+                        uint32_t avail = caplen - payload_off;    /* safe: >= 0 */
+                        uint32_t copy_len = (avail < PCV_DNS_SLOT_BYTES)
+                                          ? avail : PCV_DNS_SLOT_BYTES;
+                        dns_ring_enqueue(agg, packet->data + payload_off,
+                                         copy_len, PCV_SLOT_DNS, NULL);
+                    }
+                }
+            } else if (l4_proto == 6) {
+                /* ---- TLS ClientHello SNI candidate ----
+                 * The TCP header is variable-length: re-check that the
+                 * data-offset nibble byte (TCP header byte 12 = frame index
+                 * l4_off+12) is captured before reading it, with underflow-safe
+                 * additions on the l4_off side (mirroring the UDP guard). */
+                if ((uint64_t)l4_off + 13u < (uint64_t)caplen) {
+                    const uint8_t* t = packet->data + l4_off;
+                    uint32_t tcp_hlen = (uint32_t)(((t[12] >> 4) & 0x0F) * 4u);
+                    if (tcp_hlen >= 20u &&
+                        (uint64_t)l4_off + tcp_hlen <= (uint64_t)caplen) {
+                        uint32_t payload_off = l4_off + tcp_hlen;
+                        /* Need the 5-byte TLS record header + the first
+                         * handshake byte (6 bytes) to run the probe. */
+                        if ((uint64_t)payload_off + 6u <= (uint64_t)caplen) {
+                            const uint8_t* d = packet->data;
+                            /* Heuristic triple keyed off the TLS bytes (NOT the
+                             * port): handshake record (0x16), TLS major version
+                             * 3 (0x03), ClientHello handshake type (0x01). Port
+                             * 443 is not required - any TCP ClientHello matches.
+                             * No TLS length validation here: that is the
+                             * resolver's hardened job. */
+                            if (d[payload_off] == 0x16 &&
+                                d[payload_off + 1] == 0x03 &&
+                                d[payload_off + 5] == 0x01) {
+                                pcv_flow_key_v6 fk;
+                                pcv_flow_extract_key_v6(packet, &fk);
+                                uint32_t avail = caplen - payload_off;
+                                uint32_t copy_len = (avail < PCV_DNS_SLOT_BYTES)
+                                                  ? avail : PCV_DNS_SLOT_BYTES;
+                                dns_ring_enqueue(agg, d + payload_off, copy_len,
+                                                 PCV_SLOT_TLS, &fk);
+                            }
+                        }
+                    }
                 }
             }
         }

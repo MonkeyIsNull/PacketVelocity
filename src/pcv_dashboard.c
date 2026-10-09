@@ -329,6 +329,22 @@ size_t pcv_dash_snapshot_json(pcv_dash_agg* agg, char* buf, size_t size) {
             }
             pcv_resolve_lookup(agg->resolver, &ks, sname, sizeof(sname));
             pcv_resolve_lookup(agg->resolver, &kd, dname, sizeof(dname));
+
+            /* SNI (per-flow, the EXACT requested hostname) OVERRIDES the IP-map
+             * name for the server endpoint of this row. The side map tries both
+             * orientations and reports which endpoint is the server, so the name
+             * lands on the :443 side whether this is the forward (upload) or the
+             * reverse (download) row of the connection. */
+            char sni[PCV_NAME_MAX_JSON];
+            int server_is_src = 0;
+            if (pcv_resolve_flow_sni(agg->resolver, &r->key, sni, sizeof(sni),
+                                     &server_is_src) > 0) {
+                if (server_is_src) {
+                    memcpy(sname, sni, strlen(sni) + 1);
+                } else {
+                    memcpy(dname, sni, strlen(sni) + 1);
+                }
+            }
         }
         json_escape(sname, sname_e, sizeof(sname_e));
         json_escape(dname, dname_e, sizeof(dname_e));
